@@ -283,7 +283,7 @@ if __name__ == "__main__":
     proxy_socket = connect_proxy(args.proxy.lower(), args.server.lower())
     prox_end_time_ns = int(time.time_ns())
 
-    t = TLSClientHandshake("args.message")
+    t = TLSClientHandshake(args.message)
     response = send_message(proxy_socket, t.to_byte_stream())
     # TODO: handle the response
-    print(response.decode())
+    print(str(response))
