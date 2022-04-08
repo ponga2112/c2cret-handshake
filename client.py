@@ -216,18 +216,35 @@ def connect_proxy(proxy_host: str, server: str) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     print(f"+ Connecting to proxy: {proxy_host} ...")
     sock.connect((urlparse(proxy_host).hostname, urlparse(proxy_host).port))
-    if not urlparse("https://" + server).port:
-        server = server + ":443"
-    c_str = "CONNECT " + server + " HTTP/1.1\r\n\r\n"
+    port = 443
+    try:
+        port = server.split(":")[1]
+        server = server.split(":")[0]
+    except:
+        pass
+    c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
     print(f" > {c_str.rstrip()}")
     sock.sendall(c_str.encode())
     resp = sock.recv(1024)
     print(" < " + resp.decode().split("\r\n")[0])
-    # TODO: short circuit this for testing
-    # if int(resp.decode().split("\r\n")[0].split(" ")[1]) != 200:
-    #     sock.close()
-    #     print(f"Error: The proxy did not accept our connect request.")
-    #     return None
+    # we expect and HTTP/200 for our CONNECT request
+    if int(resp.decode().split("\r\n")[0].split(" ")[1]) != 200:
+        sock.close()
+        print(f"Error: The proxy did not accept our connect request.")
+        return None
+    return sock
+
+
+def connect_direct(server: str) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    print(f"+ Connecting DIRECT: {server} ...")
+    port = 443
+    try:
+        port = server.split(":")[1]
+        server = server.split(":")[0]
+    except:
+        pass
+    sock.connect((server, port))
     return sock
 
 
