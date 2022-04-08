@@ -244,7 +244,7 @@ def connect_direct(server: str) -> socket.socket:
         server = server.split(":")[0]
     except:
         pass
-    sock.connect((server, port))
+    sock.connect((server, int(port)))
     return sock
 
 
@@ -297,7 +297,8 @@ if __name__ == "__main__":
         exit(1)
     # Proxy CONNECT PHASE
     prox_start_time_ns = int(time.time_ns())
-    proxy_socket = connect_proxy(args.proxy.lower(), args.server.lower())
+    # proxy_socket = connect_proxy(args.proxy.lower(), args.server.lower())
+    proxy_socket = connect_direct(args.server.lower())
     prox_end_time_ns = int(time.time_ns())
 
     t = TLSClientHandshake(args.message)
