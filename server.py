@@ -149,7 +149,8 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
         msg = self.rfile.read(int(msg_hex_str[12:], 16))
         print(msg.hex())
         sni = self._get_sni(msg.hex())
-        print(f"___ {sni} ___")
+        sni_str = bytes.fromhex(sni.split(".")[0]).decode()
+        print(f"___ {sni_str} ___")
         # with open("bin.out", "wb") as fh:
         #     fh.write(msg)
         # print(msg)
@@ -262,5 +263,6 @@ if __name__ == "__main__":
         TCPServerInstance.serve_forever()
     except KeyboardInterrupt:
         TCPServerInstance.shutdown()
+        TCPServerInstance.server_close()
         print("[+] Exiting.")
         exit(0)
