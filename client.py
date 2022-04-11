@@ -29,7 +29,7 @@ import re
 NS_TO_MS = 1000000
 # MAX_MSG_LEN = 284
 MAX_MSG_LEN = 256
-is_connected = True
+is_connected = False
 
 
 class TLSClientHandshake:
@@ -262,7 +262,10 @@ def _extract_certs(hex_array: list, position: int) -> list:
     position = position + 3
     certs_handshake_position = 0
     while certs_handshake_position < certs_len:
-        cert_len = int("".join(hex_array[position : position + 3]), 16)
+        try:
+            cert_len = int("".join(hex_array[position : position + 3]), 16)
+        except:
+            break
         position = position + 3
         cert_hex_arrays.append(hex_array[position : position + cert_len])
         position = position + cert_len
