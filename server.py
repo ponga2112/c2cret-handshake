@@ -191,13 +191,14 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
         # print(msg.hex())
         # TODO: we need to handle more than just type(str) here...
         sni = self._get_sni(msg.hex())
-        print(f" < {sni}")
+        # print(f" < {sni}")
         # sni_str = bytes.fromhex(sni.split(".")[0]).decode()
         # print(f"___ {sni_str} ___")
         # with open("bin.out", "wb") as fh:
         #     fh.write(msg)
         # print(msg)
         cmd, payload = self.decode_msg(sni)
+        print(f" < {payload}")
         # TODO: for demo purposes
         has_cmd = False
         response_msg_bytes = b""
@@ -210,6 +211,9 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
         if cmd == "ping":
             has_cmd = True
             response_msg_bytes = self.create_message(b"PONG!")
+        if cmd == "CMD":
+            has_cmd = True
+            response_msg_bytes = self.create_message(b"OK")
         if not has_cmd:
             # For now, just echo back what was sent in the SNA msg
             response_msg_bytes = self.create_message(sni.encode())
@@ -218,6 +222,7 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
     def create_message(self, msg: bytes) -> bytes:
         server_hello, certificate = self.tls_server_handshake.create_handshake(msg)
         header = bytes.fromhex("160303") + struct.pack(">H", (len(server_hello) + len(certificate)))
+        print(f" > {msg.decode()}")
         return header + server_hello + certificate
 
     def _get_sni(self, hex_str: str) -> str:
@@ -280,7 +285,11 @@ class ThreadedTCPSocketServer(socketserver.StreamRequestHandler):
     def decode_msg(self, msg: str) -> typing.Tuple[str, str]:
         """Extracts the smuggled SNI message from the Client Hello"""
         # TODO: For the momement, only handles string types, not arbitrary byte payloads - Fix this up
-        payload = msg.split(".")[0]
+        payload = ""
+        try:
+            payload = bytes.fromhex(msg.split(".")[0]).decode()
+        except:
+            payload = msg.split(".")[0]
         cmd = payload.split(" ")[0]
         return (cmd, payload)
 
