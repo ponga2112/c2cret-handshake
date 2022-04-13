@@ -247,7 +247,7 @@ def _validate_handshake_msg(hex_str: str, hex_array: list) -> int:
         is_valid_handshake = False
     if hex_str[10:12] != "0b":
         # If not a Certificate type message
-        is_valid_handshake = False
+        # is_valid_handshake = False
         current_obj_len = int(hex_str[12:18], 16)
         if (current_obj_len < 1) or (current_obj_len > max_len):
             is_valid_handshake = False
@@ -301,6 +301,8 @@ def _find_san_records(cert_list: list) -> list:
     # TODO: WARN: But I want to keep this code as lib-independant as possible. So, this is us, on the raggedy edge :/
     san_records = []
     for cert in cert_list:
+        if san_records:
+            break
         hex_str = "".join(cert)
         byte_position = [
             (m.start(0), m.end(0))
