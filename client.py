@@ -421,7 +421,7 @@ if __name__ == "__main__":
         reqs_list_str.append(args.message)
         reqs_list_byte_stream.append(TLSClientHandshake(args.message).to_byte_stream())
     else:
-        reqs_list_str.append("ping")
+        reqs_list_str.append("ping?")
         reqs_list_byte_stream.append(TLSClientHandshake("ping").to_byte_stream())
         reqs_list_str.append("DEMO_CMD_1")
         reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_1").to_byte_stream())
