@@ -356,14 +356,22 @@ if __name__ == "__main__":
     # TCPServerInstance = socketserver.ThreadingTCPServer(("0.0.0.0", int(port)), ThreadedTCPSocketServer)
     C2Server = TLSServer(("0.0.0.0", port), None)
     C2Server.init()
+    C2Server.allow_reuse_address = True
+    C2Server.allow_reuse_port = True
+    server_thread = threading.Thread(target=C2Server.serve_forever,daemon=True)
     print(f"[+] Listening on 0.0.0.0:{port}")
+    print("Type 'exit' to terminate the process.")
     try:
-        # TODO: Can't Reuse port while bind port is in TIME-WAIT state !!
-        C2Server.allow_reuse_address = True
-        C2Server.allow_reuse_port = True
-        C2Server.serve_forever()
+        server_thread.start()
+        while True:
+            # get input from console
+            cmd = input("c2_server$ ")
+            if cmd == "exit":
+                break
+        raise KeyboardInterrupt
     except KeyboardInterrupt:
         C2Server.shutdown()
         C2Server.server_close()
+        server_thread.join()
         print("[+] Exiting.")
         exit(0)
