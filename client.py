@@ -5,14 +5,64 @@ client.py
 
 PoC To Smuggle Messages through an intercepting HTTPS proxy using only the TLS Handshake.
 
-Client Max Bytes Per TLS Client Hello: 284 / 2 ( /2 because of encoding)
-Server Max Bytes Per TLS Server Hello: 16k - TLS overhead [~15k] / 2 ( /2 because of encoding)
+"""
 
-TODO:
-    1. Implement Reliable Packetization Protocol
-    DONE  - 2. Implment server.py (using x509 SAN fields for smuggling)
-    3. Test and investigate how detectable this is as a C2 channel
- 
+"""
+    PROTOCOL:
+
+    Use *TLS Random Seed Field* (32 bytes) for our 'Protocol Control Channel' - This is analogous to a TCP Segment Header
+
+    Length      Field
+    ------------------------
+    [2 bytes]   Client ID [max 65k clients] ;; TCP Analog: Source Port + Dest Port (Session ID)
+    [2 bytes]   Message Type (*** See Message Schema Below ***)
+    [8 bytes]   Sequence Number [Used for fragmentation: Max Total Message size = 2^32 * MAX_MSG_LEN ~ 1TB]
+    [16 bytes]  Checksum (CRC) - Integrety check on PAYLOAD
+"""
+
+"""
+    MESSAGE TYPE  (CLIENT):
+
+    Bytes       Message Type
+    \x00\x01    Heartbeat           # Simple heartbeat telling the Server we are up
+    \x00\x02    ACK                 # Last MSG acknowledged
+    \x01\x01    Response Complete   # Sent at end of a frangmented MSG or when MSG_LEN < MAX_MSG_LEN
+    \x01\x02    Response Fragment   # Sent if MSG_LEN > MAX_MSG_LEN and not last Fragment in sequence
+    \x01\x03    CRC Failed          # Tells the server to retransmit the Segment specified in Sequence num field
+    
+"""
+
+"""
+    MESSAGE TYPE  (SERVER):
+
+    Bytes       Message Type
+    \x00\x01    ACK                 # Last MSG acknowledged
+    \x00\x02    CMD Available       # Last MSG acknowledged
+    \x01\x01    Request Complete    # Sent at end of a frangmented MSG or when MSG_LEN < MAX_MSG_LEN
+    \x01\x02    Request Frangment   # Sent if MSG_LEN > MAX_MSG_LEN and not last Fragment in sequence
+    
+"""
+
+"""
+    PAYLOAD:
+
+    Use *Client Hello Server Name Indication (SNI) Field* to smuggle Messages
+
+    Format: {MESSAGE}.tld
+        Where `.tld` is a random generated TLD of MAX LEN 5 chars (5 bytes)
+
+    NOTE: MAX LEN of an SNI FIELDS is 255 bytes. Our random TLD consumes 5 of those bytes (including the '.' char)
+        Thus, MAX_MSG_LEN = 250 bytes
+    
+    NOTE: Messages being packed into the SNI are converted to ASCII HEX strings.
+        Thus, a message before packing will result in a 2x message length after being packed.
+
+    Example: A raw message of "hello" which has a length of 5 bytes will result in:
+        >>> make_sni(b"hello" + _get_random_tld())
+            '68656c6c6f.kshf'
+        Which has a total length of 15 bytes
+            [ MSG_LEN*2 + MAX_TLD_LEN = TOTAL_MSG_LEN ]
+
 """
 
 import argparse
@@ -27,8 +77,8 @@ import subprocess
 import re
 
 NS_TO_MS = 1000000
-# MAX_MSG_LEN = 284
-MAX_MSG_LEN = 256
+# MAX_MSG_LEN to include max random TLD_LEN:
+MAX_MSG_LEN = 255
 is_connected = False
 
 
