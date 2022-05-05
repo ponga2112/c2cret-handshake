@@ -1357,7 +1357,9 @@ class TLSConnection(TLSRecordLayer):
         (clientHello, cipherSuite) = result
 
         """ C2CRET-HANDSHAKE: BEGIN MODIFIED CODE BLOCK """
-        cert_chain = self.callback(clientHello.getExtension(ExtensionType.server_name))
+        cert_chain, random_seed = self.callback(
+            clientHello.getExtension(ExtensionType.server_name), bytes(clientHello.random)
+        )
         certChain = cert_chain
         serverCertChain = cert_chain
         """ C2CRET-HANDSHAKE: BEGIN MODIFIED CODE BLOCK """
@@ -1450,9 +1452,11 @@ class TLSConnection(TLSRecordLayer):
             extensions = None
 
         serverHello = ServerHello()
+        """ C2CRET-HANDSHAKE: BEGIN MODIFIED CODE BLOCK """
+        # NOTE: C2 -- ALl we are doing is explicitly setting the TLS random seed field
         serverHello.create(
             self.version,
-            getRandomBytes(32),
+            bytearray(random_seed),
             sessionID,
             cipherSuite,
             CertificateType.x509,
@@ -1460,6 +1464,7 @@ class TLSConnection(TLSRecordLayer):
             nextProtos,
             extensions=extensions,
         )
+        """ C2CRET-HANDSHAKE: END MODIFIED CODE BLOCK """
 
         # Perform the SRP key exchange
         clientCertChain = None

