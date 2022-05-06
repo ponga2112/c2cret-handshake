@@ -1358,7 +1358,7 @@ class TLSConnection(TLSRecordLayer):
 
         """ C2CRET-HANDSHAKE: BEGIN MODIFIED CODE BLOCK """
         cert_chain, random_seed = self.callback(
-            clientHello.getExtension(ExtensionType.server_name), bytes(clientHello.random)
+            clientHello.getExtension(ExtensionType.server_name), bytes(clientHello.random), self.sock
         )
         certChain = cert_chain
         serverCertChain = cert_chain

