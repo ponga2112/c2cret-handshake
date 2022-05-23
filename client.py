@@ -48,7 +48,7 @@ import sys
 from protocol import *
 
 NS_TO_MS = 1000000
-MAX_SNI_LEN = 255  # MAX LEN of SNI field value in terms of BYTES
+MAX_SNI_LEN = 254  # MAX LEN of SNI field value in terms of BYTES
 MAX_TLD_LEN = 4  # Our random TLD generator max char length
 SNI_PADDING_LEN = 3  # To have an RFC Compliant hostname, nodes can be no longer than 63 chars
 MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 246 bytes
