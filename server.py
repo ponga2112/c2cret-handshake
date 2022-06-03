@@ -46,6 +46,7 @@ import socket
 import sys
 import argparse
 import queue
+import os
 import time
 import math
 
@@ -63,7 +64,8 @@ MAX_HOST_LEN = 8
 MAX_DOMAIN_LEN = 6
 MAX_CLIENT_AGE = 60  # Mark a client disconnected if it does not check in for this number of seconds
 VERBOSE = True  # Show some additional output
-MAX_CONSOLE_MSG_LEN = 500  # only print this number of chars
+MAX_CONSOLE_MSG_LEN = 120  # only print this number of chars
+NS_TO_MS = 100000
 
 # This Mixin is not that exciting since... ALL we are doing is handshaking TLS
 class TLSSocketServerMixIn:
@@ -87,11 +89,24 @@ class Client:
         self.last_poll_ts = last_poll_ts
         self.is_connected = False
         self.pending_cmd = []
+        self.last_cmd = ""
+        self.cmd_count = 0
         self.fragments = []
+        # TODO: unique id should be used to uniquely identify a client - need to implement this in the client
         self.unique_id = unique_id
         self.src = src
         # TODO: Implement more cool data elements, like OS type/version, and other sweet telemetry gathered...
         # This should be a pretty substantial list of things....
+        self.stats = {
+            "total_rtt_ms": 0,
+            "packet_count": 0,
+            "bytes_per_sec": 0,
+            "total_xfer_time": 0,
+        }
+        try:
+            os.makedirs("files")
+        except FileExistsError:
+            pass
 
     def __str__(self):
         return str(vars(self))
@@ -180,7 +195,10 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             if self.CLIENT_DICT[client_id].pending_cmd:
                 reply_msg_headers.header = client_id + ServerMessage.CMD_AVAILABLE
                 cmd_msg = self.CLIENT_DICT[client_id].pending_cmd.pop().encode()
+                self.CLIENT_DICT[client_id].last_cmd = cmd_msg
+                self.CLIENT_DICT[client_id].cmd_count += 1
                 server_reply_payload = cmd_msg
+                self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS)
             else:
                 reply_msg_headers.header = client_id + ServerMessage.ACK
         if self._is_response_or_fragment(protocol_headers) and is_existing_client:
@@ -190,18 +208,16 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             if client_msg_type == ClientMessage.RESPONSE:
                 # We have a fully assembed payload, do something with it
                 response_bytes = b"".join(self.CLIENT_DICT[client_id].fragments)
-                # try to interpret payload as a string
-                response_str = ""
-                try:
-                    response_str = response_bytes.decode().rstrip()
-                except:
-                    response_str = "[!] Could not decode bytes as string!"
-                ellipsis = ""
-                if len(response_str) > MAX_CONSOLE_MSG_LEN:
-                    ellipsis = "..."
-                self._append_log_message(
-                    f"client '{client_id.hex()}' sent {len(response_bytes)} bytes. Response Message: {response_str[:MAX_CONSOLE_MSG_LEN]+ellipsis}"
+                pt = self.CLIENT_DICT[client_id].stats["total_rtt_ms"]
+                self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS) - pt
+                self.CLIENT_DICT[client_id].stats["packet_count"] = len(self.CLIENT_DICT[client_id].fragments)
+                total_xfer_time = self.CLIENT_DICT[client_id].stats["total_rtt_ms"]
+                self.CLIENT_DICT[client_id].stats["payload_bytes"] = len(response_bytes)
+                self.CLIENT_DICT[client_id].stats["total_xfer_time"] = total_xfer_time
+                self.CLIENT_DICT[client_id].stats["bytes_per_sec"] = round(
+                    (len(response_bytes) / ((self.CLIENT_DICT[client_id].stats["total_rtt_ms"]) / 1000)), 2
                 )
+                self._append_log_message(self._record_client_msg(client_id, response_bytes))
                 # clear our fragments buffer
                 self.CLIENT_DICT[client_id].fragments = []
         if is_existing_client:
@@ -214,6 +230,27 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
         self.set_cert(server_reply_payload)
         return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
+
+    def _record_client_msg(self, client_id: bytes, response_bytes: bytes) -> str:
+        cfile = self.CLIENT_DICT[client_id].last_cmd.decode().replace(" ", "_").replace("/", ".").replace("\\", ",")
+        cfile = str(self.CLIENT_DICT[client_id].cmd_count) + "_" + cfile
+        cpath = "files/" + client_id.hex() + "/" + cfile
+        # try to interpret payload as a string
+        response_str = ""
+        try:
+            response_str = response_bytes.decode().rstrip()
+        except:
+            response_str = "[!] Could not decode bytes as string!"
+        try:
+            os.makedirs("files/" + client_id.hex())
+        except FileExistsError:
+            pass
+        with open(cpath, "wb") as fh:
+            fh.write(response_bytes)
+        ellipsis = ""
+        if len(response_str) > MAX_CONSOLE_MSG_LEN:
+            ellipsis = "..."
+        return f"Client '{client_id.hex()}' Response: {response_str[:MAX_CONSOLE_MSG_LEN]+ellipsis} [{len(response_bytes)} bytes written to '{cpath}'] | Stats: {self.CLIENT_DICT[client_id].stats}"
 
     # We include this KEYSTORE object in the callback because we're being invoked from the tlslite-ng lib
     KEYSTORE = type(
