@@ -139,7 +139,7 @@ class Session:
         # print("DEBUG")
         # Now parse our header
         # The Server tells us what our client ID will be
-        if Message().get_msg_type(proto_header) != ServerMessage.TEST:
+        if Message().get_msg_type(proto_header) == ServerMessage.TEST:
             print(f"Raw Protocol Header: {proto_header}")
             print(f"Raw SAN Payload: {san_payload}")
             return
@@ -686,6 +686,8 @@ if __name__ == "__main__":
     # This so we can persist even if the client crashes or is quit, for example
     #
     # Validate that we have an established session
+    if args.test:
+        exit(0)
     if not session.is_connected:
         print(f"[!] Error - Could not establish a C2 Session with the Server. Details: {session.result_msg}")
         exit(1)

@@ -152,7 +152,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             reply_msg_headers = Message()
             reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + ServerMessage.TEST
 
-            server_reply_payload = reply_msg_headers.hex().encode() + b""
+            server_reply_payload = reply_msg_headers.hex().encode() + b"hi there"
             self.set_cert(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
 
