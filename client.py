@@ -142,6 +142,21 @@ class Session:
         if Message().get_msg_type(proto_header) == ServerMessage.TEST:
             print(f"Raw Protocol Header: {proto_header}")
             print(f"Raw SAN Payload: {san_payload}")
+            print()
+            msg = san_payload.decode().split(",")
+            if msg[0] == "_FOOBAR_":
+                print("[+] Valid SAN payload recieved from the Server!")
+            else:
+                print("[!] Invalid SAN message from server :(")
+            if msg[1] == "True":
+                print("[+] Random Seed Smuggling PASSED!")
+            else:
+                print("[!] Random Seed Smuggling failed :(")
+            if msg[2] == "True":
+                print("[+] SNI Smuggling PASSED!")
+            else:
+                print("[!] SNI smnuggling failed :(")
+            print()
             return
         self.client_id = Message().get_client_id(proto_header)
         if Message().get_msg_type(proto_header) != ServerMessage.ACK:

@@ -148,11 +148,13 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         client_msg.set(protocol_headers)
         if TEST_MODE:
             # Test out client connectivity - Dont actually do C2 things
-            self._print_test_results(client_msg, sni_object, protocol_headers, sock)
+            results = self._print_test_results(client_msg, sni_object, protocol_headers, sock)
             reply_msg_headers = Message()
             reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + ServerMessage.TEST
 
-            server_reply_payload = reply_msg_headers.hex().encode() + b"hi there"
+            server_reply_payload = (
+                reply_msg_headers.hex().encode() + b"_FOOBAR_," + str(results[0]).encode() + str(results[1]).encode()
+            )
             self.set_cert(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
 
@@ -516,7 +518,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
 
     def _print_test_results(
         self, client_msg: Message, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
-    ) -> None:
+    ) -> typing.Tuple[bool, bool]:
         print()
         print(f"< CONNECTION FROM: {sock.getpeername()[0] + ':' + str(sock.getpeername()[1])}")
         print(f"<   Raw Protocol Headers: {self._to_hex_x_notation(protocol_headers)}")
@@ -548,15 +550,20 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         except:
             print(f"<      ERROR: FAILED TO DECODE SNI!")
         print()
+        sni_success = False
+        rnd_success = False
         if header_str == "_FOOBAR_":
             print("[+] Random Seed Smuggling PASSED!")
+            rnd_success = True
         else:
             print("[!] Random Seed Smuggling FAILED")
         if sni_bytes_decoded == "_FOOBAR_":
             print("[+] SNI Smuggling PASSED!")
+            sni_success = True
         else:
             print("[!] SNI Smuggling FAILED")
         print("Test complete.")
+        return (rnd_success, sni_success)
 
     @staticmethod
     def _decode_msg(msg: bytes) -> bytes:
