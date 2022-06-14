@@ -152,6 +152,9 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         reply_msg_headers = Message()
         # Get our SNI payload (which we may or may not need, depending on msg type
         sni_decoded_bytes = b""
+        if VERBOSE:
+            print(f"Raw SNI: {sni_object.hostNames[0]}")
+        sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
         try:
             sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
         except:
