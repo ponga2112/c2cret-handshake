@@ -149,7 +149,13 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         if TEST_MODE:
             # Test out client connectivity - Dont actually do C2 things
             self._print_test_results(client_msg, sni_object, protocol_headers, sock)
-            reply_headers = client_msg.get_client_id(protocol_headers) + ServerMessage.ACK
+            reply_msg_headers = Message()
+            reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + ServerMessage.ACK
+
+            server_reply_payload = reply_msg_headers.hex().encode() + b""
+            self.set_cert(server_reply_payload)
+            return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
+
             server_reply_payload = reply_headers.hex().encode() + b"_FOOBAR_".hex().encode()
             self.set_cert(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
