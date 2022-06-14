@@ -118,7 +118,10 @@ class Session:
         if not init_result:
             return
         if test_mode:
-            self._set_tls_client_hello(ClientMessage().test(), self._make_sni(b"_FOOBAR_"))
+            payload = b"_FOOBAR_"
+            print(f"TEST MODE: Sending '{payload}' as our payload... ")
+
+            self._set_tls_client_hello(ClientMessage().test(), self._make_sni(payload))
         else:
             #
             # Send CONNECT to server to establish protocol level communication

@@ -148,38 +148,9 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         client_msg.set(protocol_headers)
         if TEST_MODE:
             # Test out client connectivity - Dont actually do C2 things
-            print()
-            print(f"< CONNECTION FROM: {sock.getpeername()[0] + ':' + str(sock.getpeername()[1])}")
-            print(f"<   Raw Protocol Headers: {self._to_hex_x_notation(protocol_headers)}")
-            print(f"<      cid: {self._to_hex_x_notation(client_msg.get_client_id(protocol_headers))}")
-            print(f"<      type: {ClientMessage().type_to_text(client_msg.get_msg_type(protocol_headers))}")
-            try:
-                payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
-            except:
-                payload_len = -1
-            print(f"<      len: {payload_len}")
-            try:
-                print(f"<      payload: {bytes.fromhex(client_msg.get_payload(protocol_headers).decode()).decode()}")
-            except:
-                print(
-                    f"<      payload: __INVALID_PAYLOAD__: '{self._to_hex_x_notation(client_msg.get_payload(protocol_headers))}'"
-                )
-            sni_bytes = b""
-            try:
-                sni_bytes = sni_object.hostNames[0]
-                print(f"<   Raw SNI: {sni_bytes.decode()}")
-            except:
-                print(f"<  ERROR: NO SNI PRESENT!")
-            try:
-                print(f"<   DECODED SNI BYTES: {self._decode_msg(sni_bytes)}")
-            except:
-                print(f"<  ERROR: FAILED TO DECODE SNI!")
-            try:
-                print(f"<   DECODED SNI STRING: {self._decode_msg(sni_bytes).decode()}")
-            except:
-                print(f"<  ERROR: SNI DOES NOT DECODE TO A STRING!")
+            self._print_test_results(client_msg, sni_object, protocol_headers, sock)
             reply_headers = client_msg.get_client_id(protocol_headers) + ServerMessage.ACK
-            server_reply_payload = reply_headers.hex().encode() + sni_bytes.hex().encode()
+            server_reply_payload = reply_headers.hex().encode() + b"_FOOBAR_".hex().encode()
             self.set_cert(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
         # end if TEST_MODE
@@ -536,6 +507,50 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         except:
             return False
         return True
+
+    def _print_test_results(
+        self, client_msg: Message, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
+    ) -> None:
+        print()
+        print(f"< CONNECTION FROM: {sock.getpeername()[0] + ':' + str(sock.getpeername()[1])}")
+        print(f"<   Raw Protocol Headers: {self._to_hex_x_notation(protocol_headers)}")
+        print(f"<      cid: {self._to_hex_x_notation(client_msg.get_client_id(protocol_headers))}")
+        print(f"<      type: {ClientMessage().type_to_text(client_msg.get_msg_type(protocol_headers))}")
+        try:
+            payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
+        except:
+            payload_len = -1
+        print(f"<      len: {payload_len}")
+        header_str = ""
+        try:
+            header_str = bytes.fromhex(client_msg.get_payload(protocol_headers).decode()).decode()
+            print(f"<      payload: {header_str}")
+        except:
+            print(
+                f"<      payload: __INVALID_PAYLOAD__: '{self._to_hex_x_notation(client_msg.get_payload(protocol_headers))}'"
+            )
+        sni_bytes = b""
+        sni_bytes_decoded = b""
+        try:
+            sni_bytes = sni_object.hostNames[0]
+            print(f"<   Raw SNI: {sni_bytes.decode()}")
+        except:
+            print(f"<   ERROR: NO SNI PRESENT!")
+        try:
+            sni_bytes_decoded = self._decode_msg(sni_bytes).decode()
+            print(f"<      Decoded SNI bytes: {sni_bytes_decoded}")
+        except:
+            print(f"<      ERROR: FAILED TO DECODE SNI!")
+        print()
+        if header_str == "_FOOBAR_":
+            print("[+] Random Seed Smuggling PASSED!")
+        else:
+            print("[!] Random Seed Smuggling FAILED")
+        if sni_bytes_decoded == "_FOOBAR_":
+            print("[+] SNI Smuggling PASSED!")
+        else:
+            print("[!] SNI Smuggling FAILED")
+        print("Test complete.")
 
     @staticmethod
     def _decode_msg(msg: bytes) -> bytes:
