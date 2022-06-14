@@ -672,7 +672,7 @@ if __name__ == "__main__":
         if not args.direct:
             proxy = proxy_hostname + ":" + str(proxy_port)
     # If we get here, args are valid. Now we setup are C2 Session
-    session = Session(server=args.server.lower(), proxy=proxy)
+    session = Session(server=args.server.lower(), proxy=proxy, test_mode=args.test)
     #
     # TODO: Make client sessions persist!
     # Which means a client will hash some machine specific attribute and write it to file, etc
