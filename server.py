@@ -299,6 +299,8 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             return ServerMessage.ABORT
         # computer our crc
         if m.compute_crc(fragment) != crc:
+            if VERBOSE:
+                print(f"FRAGMENT ERROR: {m.compute_crc(fragment)} != {crc} on '{fragment.hex()}'")
             return ServerMessage.CRC_ERROR
         # everthing looks good
         self.CLIENT_DICT[client_id].fragments.append(fragment)
