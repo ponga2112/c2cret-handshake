@@ -537,6 +537,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         """Extracts the smuggled SNI message from the Client Hello"""
         return bytes.fromhex("".join(msg.decode().split(".")[:-1]))
 
+    @staticmethod
     def _to_hex_x_notation(bs: bytes) -> str:
         return "".join(["\\x%02x" % i for i in bs])
 
