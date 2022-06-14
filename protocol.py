@@ -13,7 +13,6 @@
     [4 bytes]   Payload Length (Total length of message we are sending) [2^32] ~ 4GB
     [4 bytes]   Sequence Number [Used for fragmentation - Will never exceed Payload Length]
     [4 bytes]   Checksum (CRC) - Integrety check on PAYLOAD
-    [8 bytes]   Session ID - To uniquely idendify a session
     [16 bytes]  _UNUSED_
 
 """
@@ -34,13 +33,14 @@
 
 import random
 import subprocess
+import struct
 
 
 class Message:
     def __init__(self):
         self.header = b"\x00" * 4
-        self.body = b"\x00" * 20
-        self.payload = b"\x00" * 8
+        self.body = b"\x00" * 12
+        self.payload = b"\x00" * 16
 
     def to_bytes(self):
         return self.header + self.body + self.payload
@@ -50,8 +50,8 @@ class Message:
 
     def set(self, random_seed: bytes) -> None:
         self.header = random_seed[:4]
-        self.body = random_seed[4:24]
-        self.payload = random_seed[24:32]
+        self.body = random_seed[4:16]
+        self.payload = random_seed[16:32]
 
     def get_client_id(self, random_seed: bytes) -> bytes:
         if not random_seed:
@@ -78,15 +78,15 @@ class Message:
             random_seed = self.header + self.body + self.payload
         return random_seed[12:16]
 
-    def get_session_id(self, random_seed: bytes) -> bytes:
-        if not random_seed:
-            random_seed = self.header + self.body + self.payload
-        return random_seed[16:24]
-
     def get_payload(self, random_seed: bytes) -> bytes:
         if not random_seed:
             random_seed = self.header + self.body + self.payload
-        return random_seed[24:32]
+        return random_seed[16:32]
+
+    def set_payload(self, payload: bytes) -> None:
+        payload = payload.hex().encode()
+        self.body = struct.pack(">L", len(payload)) + self.body[4:12]
+        self.payload = payload
 
     @staticmethod
     def compute_crc(message: bytes) -> int:
@@ -124,6 +124,7 @@ class ClientMessage(Message):
     def test(self) -> bytes:
         m = Message()
         m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.TEST
+        m.set_payload(b"_FOOBAR_")
         return m.header + m.body + m.payload
 
     def heartbeat(self, client_id: bytes) -> bytes:
