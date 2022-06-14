@@ -121,6 +121,11 @@ class ClientMessage(Message):
         m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.CONNECT
         return m.header + m.body + m.payload
 
+    def test(self) -> bytes:
+        m = Message()
+        m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.TEST
+        return m.header + m.body + m.payload
+
     def heartbeat(self, client_id: bytes) -> bytes:
         m = Message()
         m.header = client_id + self.POLL

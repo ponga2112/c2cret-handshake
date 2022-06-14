@@ -177,6 +177,10 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 print(f"< DECODED SNI STRING: {self._decode_msg(sni_bytes).decode()}")
             except:
                 print(f"< ERROR: SNI DOES NOT DECODE TO A STRING!")
+            reply_headers = client_msg.get_client_id(protocol_headers) + ServerMessage.ACK
+            server_reply_payload = reply_headers.hex().encode() + sni_bytes
+            self.set_cert(server_reply_payload)
+            return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
         # end if TEST_MODE
         client_id = client_msg.get_client_id(protocol_headers)
         if client_id in self.CLIENT_DICT.keys():

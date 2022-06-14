@@ -83,7 +83,7 @@ class Session:
         b"",  # [21] unused   -
     ]
 
-    def __init__(self, server=None, proxy=None):
+    def __init__(self, server=None, proxy=None, test_mode=False):
         """
         Establishes a new C2 Session with the server specified.
         Returns an a C2Session instance.
@@ -117,11 +117,14 @@ class Session:
         init_result = self._connect_init(server, proxy)
         if not init_result:
             return
-        #
-        # Send CONNECT to server to establish protocol level communication
-        #
-        # set our connect message
-        self._set_tls_client_hello(ClientMessage().connect(), self._get_random_sni())
+        if test_mode:
+            self._set_tls_client_hello(ClientMessage().test(), self._make_sni(b"_FOOBAR_"))
+        else:
+            #
+            # Send CONNECT to server to establish protocol level communication
+            #
+            # set our connect message
+            self._set_tls_client_hello(ClientMessage().connect(), self._get_random_sni())
         # send it!!
         response = self._send_message()
         if not response:
@@ -638,14 +641,19 @@ if __name__ == "__main__":
         required=False,
         help="Print out all request and response sent/rcvd",
     )
+    arg_parse.add_argument(
+        "-t",
+        "--test",
+        action="store_true",
+        required=False,
+        help="Test Connectivity to a C2 Server",
+    )
     # Validate the the args provided
     args = arg_parse.parse_args()
     if not args.proxy and not args.direct:
         arg_parse.error("Error: Either -d for direct connect or supply a valid --proxy argument")
-        exit(1)
     if not args.server:
         arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net:8443")
-        exit(1)
     proxy = None
     proxy_hostname = proxy_scheme = ""
     proxy_port = 0
