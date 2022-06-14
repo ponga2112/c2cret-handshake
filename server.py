@@ -153,7 +153,11 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + ServerMessage.TEST
 
             server_reply_payload = (
-                reply_msg_headers.hex().encode() + b"_FOOBAR_," + str(results[0]).encode() + str(results[1]).encode()
+                reply_msg_headers.hex().encode()
+                + b"_FOOBAR_,"
+                + str(results[0]).encode()
+                + b","
+                + str(results[1]).encode()
             )
             self.set_cert(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
