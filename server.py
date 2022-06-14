@@ -583,7 +583,7 @@ if __name__ == "__main__":
     arg_parse.add_argument(
         "-t",
         "--test",
-        metavar="run_test",
+        action="store_true",
         required=False,
         help="Run in Connectivity Test Mode",
     )
