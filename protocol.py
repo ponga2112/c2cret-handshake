@@ -40,48 +40,53 @@ class Message:
     def __init__(self):
         self.header = b"\x00" * 4
         self.body = b"\x00" * 20
-        self.padding = b"\x00" * 8
+        self.payload = b"\x00" * 8
 
     def to_bytes(self):
-        return self.header + self.body + self.padding
+        return self.header + self.body + self.payload
 
     def hex(self) -> str:
-        return (self.header + self.body + self.padding).hex()
+        return (self.header + self.body + self.payload).hex()
 
     def set(self, random_seed: bytes) -> None:
         self.header = random_seed[:4]
         self.body = random_seed[4:24]
-        self.padding = b"\x00" * 8
+        self.payload = random_seed[24:32]
 
     def get_client_id(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[:2]
 
     def get_msg_type(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[2:4]
 
     def get_payload_len(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[4:8]
 
     def get_sequence_num(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[8:12]
 
     def get_crc(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[12:16]
 
     def get_session_id(self, random_seed: bytes) -> bytes:
         if not random_seed:
-            random_seed = self.header + self.body + self.padding
+            random_seed = self.header + self.body + self.payload
         return random_seed[16:24]
+
+    def get_payload(self, random_seed: bytes) -> bytes:
+        if not random_seed:
+            random_seed = self.header + self.body + self.payload
+        return random_seed[24:32]
 
     @staticmethod
     def compute_crc(message: bytes) -> int:
@@ -106,6 +111,7 @@ class ClientMessage(Message):
     RESPONSE = b"\x00\x04"
     FRAGMENT = b"\x00\x05"
     CRC_ERROR = b"\x00\x06"
+    TEST = b"\x00\x07"
 
     def __init__(self):
         pass
@@ -113,12 +119,29 @@ class ClientMessage(Message):
     def connect(self) -> bytes:
         m = Message()
         m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.CONNECT
-        return m.header + m.body + m.padding
+        return m.header + m.body + m.payload
 
     def heartbeat(self, client_id: bytes) -> bytes:
         m = Message()
         m.header = client_id + self.POLL
         return m.to_bytes()
+
+    def type_to_text(self, msg_type: bytes) -> str:
+        if msg_type == self.CONNECT:
+            return "CONNECT"
+        if msg_type == self.POLL:
+            return "POLL"
+        if msg_type == self.ACK:
+            return "ACK"
+        if msg_type == self.RESPONSE:
+            return "RESPONSE"
+        if msg_type == self.FRAGMENT:
+            return "FRAGMENT"
+        if msg_type == self.CRC_ERROR:
+            return "CRC_ERROR"
+        if msg_type == self.TEST:
+            return "TEST"
+        return "__INVALID_MSG_TYPE"
 
 
 class ServerMessage(Message):
