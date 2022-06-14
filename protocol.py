@@ -158,6 +158,7 @@ class ServerMessage(Message):
     CRC_ERROR = b"\x00\x05"
     ABORT = b"\x00\x06"
     SNI_DECODE_FAILED = b"\x00\x07"
+    TEST = b"\x00\x08"
     UNKNOWN = b"\xff\xff"
 
     def __init__(self):

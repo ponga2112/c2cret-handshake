@@ -139,6 +139,10 @@ class Session:
         # print("DEBUG")
         # Now parse our header
         # The Server tells us what our client ID will be
+        if Message().get_msg_type(proto_header) != ServerMessage.TEST:
+            print(f"Raw Protocol Header: {proto_header}")
+            print(f"Raw SAN Payload: {san_payload}")
+            return
         self.client_id = Message().get_client_id(proto_header)
         if Message().get_msg_type(proto_header) != ServerMessage.ACK:
             self.result_msg = f"Did not recieve an ACK message in response to our CONNECT request: Got '{Message().get_msg_type(proto_header).hex()}' instead"
