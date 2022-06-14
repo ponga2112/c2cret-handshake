@@ -154,7 +154,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         sni_decoded_bytes = b""
         if VERBOSE:
             print(f"Raw SNI: {sni_object.hostNames[0]}")
-        sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
+        # sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
         try:
             sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
         except:
