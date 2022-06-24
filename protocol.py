@@ -34,7 +34,7 @@
 
 MAX_FILE_SIZE = 2**32
 CLIENT_MAX_SNI_SIZE = 245  # max bytes a client can send in SNI
-CLIENT_MAX_SEED_SIZE = 16  # max bytes a client can send in random seen field
+CLIENT_MAX_SEED_SIZE = 15  # max bytes a client can send in random seen field
 
 import random
 import subprocess

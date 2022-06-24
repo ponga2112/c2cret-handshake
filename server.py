@@ -57,8 +57,6 @@ import http.server
 #
 
 MAX_SINGLE_MSG_LEN = 254  # max len of a single SAN entry
-CLIENT_MAX_SNI_SIZE = 245  # max bytes a client can send in SNI
-CLIENT_MAX_SEED_SIZE = 15  # max bytes a client can send in random seen field
 MAX_TOTAL_MSG_LEN = MAX_SINGLE_MSG_LEN * 62  # You can have up to 16k bytes total in a SAN record ~(roughly)
 # These for a random HOST/TLD generators
 MAX_TLD_LEN = 4
@@ -233,17 +231,17 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 reply_msg_headers.header = client_id + ServerMessage.ACK
         if client_msg_type == ClientMessage.FRAGMENT:
             mesg_decoded_bytes = b""
-            # print(f"!! DEBUG: in fragment")
+            print(f"!! DEBUG: in fragment")
             if self.CLIENT_DICT[client_id].mode == "sni":
                 try:
                     mesg_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
-                    # print(f"!! DEBUG: decoded sni: {mesg_decoded_bytes}")
+                    print(f"!! DEBUG: decoded sni: {mesg_decoded_bytes}")
                 except:
                     mesg_decoded_bytes = b"__ERROR_SERVER_FAILED_TO_DECODE_SNI!"
             else:
-                # print(f"!! DEBUG: in else seed block")
+                print(f"!! DEBUG: in else seed block")
                 mesg_decoded_bytes = client_msg.get_payload(protocol_headers)
-                # print(f"!! DEBUG: passing these bytes to assemble_response: {mesg_decoded_bytes}")
+                print(f"!! DEBUG: passing these bytes to assemble_response: {mesg_decoded_bytes}")
             reply_msg_type = self._assemble_response(client_id, protocol_headers, mesg_decoded_bytes)
             reply_msg_headers.header = client_id + reply_msg_type
             reply_msg_headers.body = client_msg.body
