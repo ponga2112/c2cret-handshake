@@ -299,6 +299,9 @@ class Session:
             if self.mode == "sni":
                 self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
             else:
+                ###
+                ### TODO: There is a bug here!!! If our payload does not fit neatly into our 16 bytes payload field, then what!@?
+                ###
                 smuggle.payload = v
                 self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
             if VERBOSE:

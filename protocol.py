@@ -10,10 +10,11 @@
     ------------------------
     [2 bytes]   Client ID [max 65k clients] ;; TCP Analog: Source Port + Dest Port (Session ID)
     [2 bytes]   Message Type (*** See Message Schema Below ***)
-    [4 bytes]   Payload Length (Total length of message we are sending) [2^32] ~ 4GB
+    [4 bytes]   Total Segments - Total message size divided by maximum segment size AKA, Number of Chunks or Fragments
     [4 bytes]   Sequence Number [Used for fragmentation - Will never exceed Payload Length]
     [4 bytes]   Checksum (CRC) - Integrety check on PAYLOAD
-    [16 bytes]  _UNUSED_
+    [1 bytes]   Length of Seed Payload - struct.pack(">B",int)
+    [15 bytes]  Payload
 
 """
 
@@ -67,7 +68,7 @@ class Message:
             random_seed = self.header + self.body + self.payload
         return random_seed[2:4]
 
-    def get_payload_len(self, random_seed: bytes) -> bytes:
+    def get_total_segments(self, random_seed: bytes) -> bytes:
         if not random_seed:
             random_seed = self.header + self.body + self.payload
         return random_seed[4:8]
@@ -82,15 +83,20 @@ class Message:
             random_seed = self.header + self.body + self.payload
         return random_seed[12:16]
 
+    def get_payload_len(self, random_seed: bytes) -> int:
+        if not random_seed:
+            random_seed = self.header + self.body + self.payload
+        return struct.unpack(">B", random_seed[16:17])[0]
+
     def get_payload(self, random_seed: bytes) -> bytes:
         if not random_seed:
             random_seed = self.header + self.body + self.payload
-        return random_seed[16:32]
+        return random_seed[17 : 17 + self.get_payload_len(random_seed)]
 
     def set_payload(self, payload: bytes) -> None:
-        payload = payload.hex().encode()
-        self.body = struct.pack(">L", len(payload)) + self.body[4:12]
-        self.payload = payload
+        if len(payload) > 15:
+            payload = b"_INVALID_SIZE"
+        self.payload = struct.pack(">B", len(payload)) + payload + (b"\x00" * (15 - len(payload)))
 
     @staticmethod
     def compute_crc(message: bytes) -> int:

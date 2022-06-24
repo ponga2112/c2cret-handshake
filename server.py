@@ -58,7 +58,7 @@ import http.server
 
 MAX_SINGLE_MSG_LEN = 254  # max len of a single SAN entry
 CLIENT_MAX_SNI_SIZE = 245  # max bytes a client can send in SNI
-CLIENT_MAX_SEED_SIZE = 16  # max bytes a client can send in random seen field
+CLIENT_MAX_SEED_SIZE = 15  # max bytes a client can send in random seen field
 MAX_TOTAL_MSG_LEN = MAX_SINGLE_MSG_LEN * 62  # You can have up to 16k bytes total in a SAN record ~(roughly)
 # These for a random HOST/TLD generators
 MAX_TLD_LEN = 4
@@ -242,7 +242,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                     mesg_decoded_bytes = b"__ERROR_SERVER_FAILED_TO_DECODE_SNI!"
             else:
                 # print(f"!! DEBUG: in else seed block")
-                mesg_decoded_bytes = reply_msg_headers.payload
+                mesg_decoded_bytes = client_msg.get_payload(protocol_headers)
                 # print(f"!! DEBUG: passing these bytes to assemble_response: {mesg_decoded_bytes}")
             reply_msg_type = self._assemble_response(client_id, protocol_headers, mesg_decoded_bytes)
             reply_msg_headers.header = client_id + reply_msg_type
@@ -251,11 +251,11 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 self.CLIENT_DICT[client_id].stats["first_fragment_ts"] = int(time.time_ns() / NS_TO_MS)
         if client_msg_type == ClientMessage.RESPONSE:
             # Lets ensure that we have a fully assembled message from the client!
-            payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
+            total_segments = struct.unpack(">L", (client_msg.get_total_segments(protocol_headers)))[0]
             payload_list = list(dict(sorted(self.CLIENT_DICT[client_id].fragments.items())).values())
-            if payload_len != len(payload_list):
+            if total_segments != len(payload_list):
                 self._append_log_message(
-                    f"Error: Client '{client_id.hex()}' sent {len(payload_list)} fragments, but we were expecting {payload_len}!"
+                    f"Error: Client '{client_id.hex()}' sent {len(payload_list)} fragments, but we were expecting {total_segments}!"
                 )
                 reply_msg_headers.header = client_id + ServerMessage.ABORT
             else:
@@ -385,7 +385,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         """Take a bytes object and turn it into a C2 Message instance"""
         h = Message()
         h.header = h.get_client_id(client_random) + h.get_msg_type(client_random)
-        h.body = h.get_payload_len(client_random) + h.get_sequence_num(client_random) + h.get_crc(client_random)
+        h.body = h.get_total_segments(client_random) + h.get_sequence_num(client_random) + h.get_crc(client_random)
         return h
 
     def init(self):
@@ -569,9 +569,10 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
     def _print_test_results(
         self, client_msg: Message, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
     ) -> typing.Tuple[bool, bool]:
+        m = Message()
         header_str = ""
         try:
-            header_str = bytes.fromhex(client_msg.get_payload(protocol_headers).decode()).decode()
+            header_str = m.get_payload(protocol_headers).decode()
         except:
             pass
         sni_bytes = b""
@@ -621,7 +622,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         print(f"<      cid: {self._to_hex_x_notation(client_msg.get_client_id(protocol_headers))}")
         print(f"<      type: {ClientMessage().type_to_text(client_msg.get_msg_type(protocol_headers))}")
         try:
-            payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
+            payload_len = struct.unpack(">L", (client_msg.get_total_segments(protocol_headers)))[0]
         except:
             payload_len = -1
         print(f"<      len: {payload_len}")
