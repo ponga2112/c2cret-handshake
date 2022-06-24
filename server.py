@@ -589,8 +589,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             if VERBOSE:
                 print(f"<      Decoded SNI bytes: {sni_bytes_decoded}")
         except:
-            if VERBOSE:
-                print(f"<      ERROR: FAILED TO DECODE SNI!")
+            pass
         if VERBOSE:
             print()
         sni_success = False

