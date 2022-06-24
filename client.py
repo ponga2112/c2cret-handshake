@@ -299,7 +299,7 @@ class Session:
             if self.mode == "sni":
                 self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
             else:
-                smuggle.payload = v.hex()
+                smuggle.payload = v.hex().encode()
                 self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
             if VERBOSE:
                 print(f"> HEADERS: {smuggle.to_bytes().hex()}")
