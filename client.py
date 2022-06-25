@@ -279,7 +279,7 @@ class Session:
         # NOTE: This all means.. our SNI smuggled payload is HALVED. This is the cost of doing business.
         # test out what hex encoding will do to us:
         max_msg_len = self.mss
-        if len(message.hex()) > len(message):
+        if len(message.hex()) > len(message) and self.mode == "sni":
             max_msg_len = int(self.mss / 2)
         chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
 
