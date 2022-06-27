@@ -63,6 +63,7 @@ MAX_RETRIES = 5  # Max num of times we will retry sending a message before givin
 VERBOSE = True
 CLIENT_MODE = "sni"
 THREADS = 1
+MAX_THREADS = 32
 
 
 class Session:
@@ -124,9 +125,10 @@ class Session:
         self.client_id = b""
         self.last_poll_time = 0
         self.message_list = []
+        self._is_tcp_connected = False
+        init_result = self._connect_init(server, proxy)
         if manual_connect:
             return
-        init_result = self._connect_init(server, proxy)
         payload = b"_C2CRET_"
         if not init_result:
             return
@@ -269,12 +271,14 @@ class Session:
         if not self.is_connected:
             return False
         self.is_heartbeat_active = False  # pause our polling thread until we are done sending our msg
-        start_time_ms = self.rtt_ms = int(int(time.time_ns()) / NS_TO_MS)
+        start_time_ms = int(int(time.time_ns()) / NS_TO_MS)
         self.bytes_sent = 0
         max_msg_len = self.mss
         if len(message.hex()) > len(message) and self.mode == "sni":
             max_msg_len = int(self.mss / 2)
         chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
+        if VERBOSE:
+            print(f"[+] Attempting to send {len(message)} bytes in {len(chunks)} threads...")
         smuggle = Message()
         # First chunk our message up into fragments
         fragments = []
@@ -298,15 +302,19 @@ class Session:
         # TODO: We have our fragments now, sned them asyncronously
         threads = []
         thread_results = []
+        bytes_sent = 0
+        # TODO !!! We need to implement MAX_THREADS !!!
         for idx, fragment in enumerate(fragments):
-            threads[idx] = threading.Thread(target=self._async_send, args=(fragment, thread_results, idx))
+            threads.insert(idx, threading.Thread(target=self._async_send, args=(fragment, thread_results, idx)))
             threads[idx].start()
-            self.bytes_sent += len(fragment)
+            bytes_sent += len(fragment)
+        if VERBOSE:
+            print(f"[+] Submitted {bytes_sent} bytes to {len(threads)} threads.")
         # Now check our results
         for idx in range(len(fragments)):
             threads[idx].join()
         was_send_successful = True
-        for idx in range(len(fragments)):
+        for idx in range(len(fragments) - 1):
             if not thread_results[idx]:
                 was_send_successful = False
                 break
@@ -325,7 +333,7 @@ class Session:
                 msg_type
             )
             return False
-        self.rtt = int((int(time.time_ns()) - start_time_ms) / NS_TO_MS)
+        total_time_ms = int(int(time.time_ns() / NS_TO_MS) - start_time_ms)
         self.bytes_sent = len(message)
         msg_text = ""
         try:
@@ -335,6 +343,10 @@ class Session:
         ellipse = ""
         if len(msg_text) > 65:
             ellipse = "...[truncated]"
+        if VERBOSE:
+            print(
+                f"[+] Send Success! Original Message Size {len(message)} bytes. Fragments: {len(chunks)}. Threads: {len(threads)}. Total Bytes Sent: {bytes_sent}. RTT: {total_time_ms}ms. BPS: {round( (len(message)/(total_time_ms/1000)) ,2)}"
+            )
         self.message_list.append(
             f"SEND > [[ {self.bytes_sent} bytes; rtt={self.rtt}ms; msg_type={smuggle.get_msg_type(proto_header).hex()}; response= ` {msg_text[:65]+ellipse} ` ]]"
         )
@@ -429,7 +441,7 @@ class Session:
                 msg_type
             )
             return False
-        self.rtt = total_rtt
+        self.rtt = int(int(time.time_ns()) / NS_TO_MS) - start_time_ms
         self.bytes_sent = len(message)
         msg_text = ""
         try:
@@ -574,6 +586,7 @@ class Session:
             print(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
             return False
         self.tcp_socket = sock
+        self._is_tcp_connected = True
         return True
 
     def _connect_direct(self, server: str) -> bool:
@@ -596,6 +609,7 @@ class Session:
             self.result_msg = "Could not socket connect to server in: _connect_direct()"
             return False
         self.tcp_socket = sock
+        self._is_tcp_connected = True
         return True
 
     def _send_message(self) -> bytes:
@@ -623,15 +637,69 @@ class Session:
         We are wrapping this stateless protocol in our own stateful one.
         Therefore, every single REQUEST/RESPONSE is stateless to the outside protocol
         """
-        start = int(time.time_ns())
-        if not self._connect_wrapper():
-            results[result_index] = b""
-            return
-        self.tcp_socket.sendall(fragment)
-        response_data = b""
-        results[result_index] = self.tcp_socket.recv(16384)
-        # So ya, we teardown the TCP socket after every REQ/RESP
-        self.tcp_socket.close()
+
+        def _log_error(msg: str):
+            print(f"[!] _async_send() failed on thread {result_index} with {msg}")
+
+        # WE NEED TO DO EVERYTHING OURSELVES IN HERE. BE ATOMIC WITH IT N SH1T
+
+        # return True
+        sock = None
+        is_connected = False
+        if self.proxy:
+            """Attempts to establish an HTTP session with the Proxy
+            Sets self.tcp_socket with the socket object and Returns the bool result
+            """
+            proxy_host = self.proxy(":")[0]
+            proxy_port = int(self.proxy.split(":")[1])
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect((proxy_host, proxy_port))
+            except Exception as e:
+                _log_error(str(e))
+                return
+            port = 443
+            try:
+                port = server.split(":")[1]
+                server = server.split(":")[0]
+            except:
+                pass
+            c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
+            sock.sendall(c_str.encode())
+            response = sock.recv(1024)
+            resp_first_line = response.decode().split("\r\n")[0]
+            if not self.is_connected:
+                print(" < " + resp_first_line)
+            # we expect and HTTP/200 for our CONNECT request
+            if int(response.decode().split("\r\n")[0].split(" ")[1]) != 200:
+                sock.close()
+                _log_error(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
+                return
+            is_connected = True
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            port = 443
+            try:
+                port = self.server.split(":")[1]
+            except:
+                pass
+            server = self.server.split(":")[0]
+
+            try:
+                sock.connect((server, int(port)))
+            except Exception as e:
+                _log_error(str(e))
+
+            if type(sock) != socket.socket:
+                _log_error("Could not socket connect to server in: _connect_direct()")
+                return
+            is_connected = True
+        if is_connected:
+            sock.sendall(fragment)
+            results.insert(result_index, sock.recv(16384))
+            sock.close()
+        return
 
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
         """Extracts SAN message from response bytes;
@@ -843,7 +911,7 @@ if __name__ == "__main__":
         if args.mode.lower() == "seed":
             CLIENT_MODE = "seed"
     if args.threads:
-        THREADS = args.threads
+        THREADS = int(args.threads)
     proxy = None
     proxy_hostname = proxy_scheme = ""
     proxy_port = 0

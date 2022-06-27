@@ -63,13 +63,13 @@ MAX_TLD_LEN = 4
 MAX_HOST_LEN = 8
 MAX_DOMAIN_LEN = 6
 MAX_CLIENT_AGE = 60  # Mark a client disconnected if it does not check in for this number of seconds
-VERBOSE = True  # Show some additional output
+VERBOSE = False  # Show some additional output
 MAX_CONSOLE_MSG_LEN = 120  # only print this number of chars
-NS_TO_MS = 1000000
 
 # This Mixin is not that exciting since... ALL we are doing is handshaking TLS
 class TLSSocketServerMixIn:
     def finish_request(self, sock, *args):
+        clt = sock.getpeername()[0] + ":" + str(sock.getpeername()[1])
         try:
             tlslite_connector = TLSConnection(sock, C2Server.callback)
             if self.handshake(tlslite_connector) == True:
@@ -77,8 +77,7 @@ class TLSSocketServerMixIn:
         except Exception as e:
             # We wrap this in a try block because drive-by scanners, crawlers will trip this all day
             # print(str(e.args))
-            print("[!] Exception occured while handling of TLS Connection in TLSSocketServerMixIn()")
-            raise e
+            print(f"[!] Exception occured while handling of TLS Connection from {clt}")
 
 
 class Client:
@@ -204,7 +203,8 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                     f"New client '{client_id.hex()}' connected from {self.CLIENT_DICT[client_id].src} Mode: {self.CLIENT_DICT[client_id].mode}, MSS: {self.CLIENT_DICT[client_id].mss} bytes"
                 )
                 self.set_cert(server_reply_payload)
-                self._print_verbose_response(server_reply_payload)
+                if VERBOSE:
+                    self._print_verbose_response(server_reply_payload)
                 return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
             else:
                 # This is a returning client
@@ -213,7 +213,8 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         if not is_existing_client:
             server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
             self.set_cert(server_reply_payload)
-            self._print_verbose_response(server_reply_payload)
+            if VERBOSE:
+                self._print_verbose_response(server_reply_payload)
             return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
         if client_msg_type == ClientMessage.POLL:
             cmd_msg = b""
@@ -291,7 +292,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         #     )
         server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
         self.set_cert(server_reply_payload)
-        self._print_verbose_response(server_reply_payload)
+
         return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
 
     def _record_client_msg(self, client_id: bytes, response_bytes: bytes) -> str:
