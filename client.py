@@ -711,7 +711,7 @@ class Session:
             """Attempts to establish an HTTP session with the Proxy
             Sets self.tcp_socket with the socket object and Returns the bool result
             """
-            proxy_host = self.proxy(":")[0]
+            proxy_host = self.proxy.split(":")[0]
             proxy_port = int(self.proxy.split(":")[1])
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
