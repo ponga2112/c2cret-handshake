@@ -126,6 +126,8 @@ class Session:
         self.last_poll_time = 0
         self.message_list = []
         self._is_tcp_connected = False
+        self._thread_slots_available = MAX_THREADS
+        self._thread_fragments_sent = 0
         init_result = self._connect_init(server, proxy)
         if manual_connect:
             return
@@ -299,28 +301,80 @@ class Session:
             #     print(f"> SNI: {sni[9:].decode()}")
             fragments.append(b"".join(self.tls_client_hello))
 
-        # TODO: We have our fragments now, sned them asyncronously
+        # TODO: We have our fragments now, send them asyncronously
         threads = []
+        threads_running = 0
+        threads_joined = 0
         thread_results = []
         bytes_sent = 0
+        self._thread_slots_available = 0
+        self._thread_fragments_sent = 0
+        total_fragments = len(fragments)
         # TODO !!! We need to implement MAX_THREADS !!!
+
+        def _thread_watcher(threads: list, threads_joined: int, available_slots: int, total_threads: int) -> None:
+            while True:
+                if threads_joined == total_threads:
+                    return
+                print(f"! DEBUG: in thread_watcher.. threads LEN={len(threads)}")
+                for idx, thread in enumerate(threads):
+                    # print(f"! DEBUG THREAD:          thread {idx} is_alive={thread.is_alive()}")
+                    if thread.is_alive():
+                        thread.join()
+                        print(f"! DEBUG:           Thread joined!")
+                    threads_joined += 1
+                    available_slots += 1
+                print(
+                    f"! DEBUG _thread_watcher(): threads_joined={threads_joined}, total_threads={total_threads}, available_slots={available_slots}"
+                )
+                time.sleep(2)
+
+        self._thread_slots_available = MAX_THREADS
+        # self.__fragments_sent_successfully = 0
+        # thread_watcher = threading.Thread(
+        #     target=_thread_watcher, args=(threads, threads_joined, self._thread_slots_available, total_fragments)
+        # )
+        # thread_watcher.start()
+        # print(f"! DEBUG: Thread watcher start")
+        threads_started = 0
+
         for idx, fragment in enumerate(fragments):
-            threads.insert(idx, threading.Thread(target=self._async_send, args=(fragment, thread_results, idx)))
-            threads[idx].start()
-            bytes_sent += len(fragment)
+            # For each fragment, hand it off to a thread
+
+            while True:
+                # print(
+                #     f"!!      DEBUG 1: len(fragments)={len(fragments)}, current_fragment_idx={idx}, available_slots={self._thread_slots_available}, threads_started={threads_started}"
+                # )
+                if self._thread_slots_available > 0:
+                    thread_results.insert(idx, b"_EMPTY_")
+                    thread = threading.Thread(target=self._async_send, args=(fragment, thread_results, idx))
+                    thread.start()
+                    threads_started += 1
+                    bytes_sent += len(fragment)
+                    break
+                else:
+                    time.sleep(1)
+
         if VERBOSE:
-            print(f"[+] Submitted {bytes_sent} bytes to {len(threads)} threads.")
+            print(f"[+] Submitted {bytes_sent} bytes to {threads_started} threads ({MAX_THREADS} concurrent threads)")
         # Now check our results
-        for idx in range(len(fragments)):
-            threads[idx].join()
-        was_send_successful = True
-        for idx in range(len(fragments) - 1):
-            if not thread_results[idx]:
-                was_send_successful = False
-                break
-        if not was_send_successful:
-            self.result_msg = "Sending of message failed - One or more fragments failed to send" + str(msg_type)
-            return False
+
+        # Wait for threads to complete...
+        while self._thread_fragments_sent < threads_started:
+            time.sleep(1)
+
+        # for idx, thread in enumerate(thread_results):
+        #     print(
+        #         f"!!      DEBUG 2: RESULTS: result_idx={idx}, len(thread_results[idx])={len(thread)}, type(thread_results[idx])={type(thread)}, bytes={thread[:40]}"
+        #     )
+
+        # if not was_send_successful:
+        #     self.result_msg = "Sending of message failed - One or more fragments failed to send" + str(msg_type)
+        #     return False
+
+        # TODO: short circuit for now
+        # exit(1)
+
         # Now send our Final response msg, telling the server we are done sending
         smuggle.header = self.client_id + ClientMessage.RESPONSE
         smuggle.body = struct.pack(">L", len(chunks)) + struct.pack(">L", 0) + struct.pack(">L", 0)
@@ -637,9 +691,16 @@ class Session:
         We are wrapping this stateless protocol in our own stateful one.
         Therefore, every single REQUEST/RESPONSE is stateless to the outside protocol
         """
+        self._thread_slots_available -= 1
+        response_bytes = b"_SEND_FAILURE_IDX=" + str(result_index).encode()
+        results.insert(result_index, response_bytes)
 
-        def _log_error(msg: str):
-            print(f"[!] _async_send() failed on thread {result_index} with {msg}")
+        def _submit_error(msg: str):
+            s = f"[!] _async_send() failed on thread {result_index} with {msg}"
+            results.insert(result_index, s.encode())
+            self._thread_slots_available += 1
+            self._thread_fragments_sent += 1
+            return
 
         # WE NEED TO DO EVERYTHING OURSELVES IN HERE. BE ATOMIC WITH IT N SH1T
 
@@ -656,8 +717,7 @@ class Session:
             try:
                 sock.connect((proxy_host, proxy_port))
             except Exception as e:
-                _log_error(str(e))
-                return
+                return _submit_error(str(e))
             port = 443
             try:
                 port = server.split(":")[1]
@@ -673,8 +733,7 @@ class Session:
             # we expect and HTTP/200 for our CONNECT request
             if int(response.decode().split("\r\n")[0].split(" ")[1]) != 200:
                 sock.close()
-                _log_error(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
-                return
+                return _submit_error(f"Error: The proxy did not accept our connect request; Got '{resp_first_line}'")
             is_connected = True
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -689,16 +748,21 @@ class Session:
             try:
                 sock.connect((server, int(port)))
             except Exception as e:
-                _log_error(str(e))
+                return _submit_error(str(e))
 
             if type(sock) != socket.socket:
-                _log_error("Could not socket connect to server in: _connect_direct()")
-                return
+                return _submit_error("Could not socket connect to server in: _connect_direct()")
+
             is_connected = True
         if is_connected:
             sock.sendall(fragment)
-            results.insert(result_index, sock.recv(16384))
+            response_bytes = sock.recv(16384)
+            results.insert(result_index, response_bytes)
             sock.close()
+        else:
+            return _submit_error("NOT CONNECTED!")
+        self._thread_slots_available += 1
+        self._thread_fragments_sent += 1
         return
 
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
