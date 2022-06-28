@@ -719,9 +719,10 @@ class Session:
             except Exception as e:
                 return _submit_error(str(e))
             port = 443
+            server = self.server
             try:
-                port = server.split(":")[1]
-                server = server.split(":")[0]
+                port = self.server.split(":")[1]
+                server = self.server.split(":")[0]
             except:
                 pass
             c_str = "CONNECT " + server + ":" + str(port) + " HTTP/1.1\r\n\r\n"
