@@ -125,6 +125,7 @@ class Session:
         self.client_id = b""
         self.last_poll_time = 0
         self.message_list = []
+        self._is_sending = False
         self._is_tcp_connected = False
         self._thread_slots_available = MAX_THREADS
         self._thread_fragments_sent = 0
@@ -308,9 +309,9 @@ class Session:
         bytes_sent = 0
         self._thread_slots_available = 0
         self._thread_fragments_sent = 0
-        self._thread_slots_available = MAX_THREADS
+        self._thread_slots_available = THREADS
         threads_started = 0
-
+        self._is_sending = True
         for idx, fragment in enumerate(fragments):
             while True:
                 # print(
@@ -318,6 +319,7 @@ class Session:
                 # )
                 if self._thread_slots_available > 0:
                     thread_results.insert(idx, b"_EMPTY_")
+                    thread_results_bool.insert(idx, False)
                     thread = threading.Thread(
                         target=self._async_send, args=(fragment, thread_results, idx, thread_results_bool)
                     )
@@ -332,9 +334,7 @@ class Session:
                     time.sleep(1)
 
         if VERBOSE:
-            print(
-                f"[+] Submitted {bytes_sent} bytes to {threads_started} fragments in ({MAX_THREADS} concurrent threads)"
-            )
+            print(f"[+] Submitted {bytes_sent} bytes to {threads_started} fragments in ({THREADS} concurrent threads)")
         # Now check our results and Wait for threads to complete...
         while self._thread_fragments_sent < threads_started:
             time.sleep(1)
@@ -371,6 +371,7 @@ class Session:
         self.message_list.append(
             f"SEND > [[ {self.bytes_sent} bytes; rtt={self.rtt}ms; msg_type={smuggle.get_msg_type(proto_header).hex()}; response= ` {msg_text[:65]+ellipse} ` ]]"
         )
+        self._is_sending = False
         self.is_heartbeat_active = True
         return True
 
@@ -985,20 +986,21 @@ if __name__ == "__main__":
     # Now that our client is up, we periodically update the console with heartbeat status and any commands that may come in form the server
     try:
         while True:
-            sys.stdout.write("\033[K")
-            if session.message_list and args.verbose:
-                if nl:
-                    print()
-                    nl = False
-                print(session.message_list.pop())
-            else:
-                nl = True
-                print(
-                    f"    Last Poll: {int(time.time()) - session.last_poll_time} seconds ago; RTT: {session.rtt}ms; Last Message: '{session.result_msg}'",
-                    end="\r",
-                )
-                sys.stdout.flush()
-            nl = False
+            if not session._is_sending:
+                sys.stdout.write("\033[K")
+                if session.message_list and args.verbose:
+                    if nl:
+                        print()
+                        nl = False
+                    print(session.message_list.pop())
+                else:
+                    nl = True
+                    print(
+                        f"    Last Poll: {int(time.time()) - session.last_poll_time} seconds ago; RTT: {session.rtt}ms; Last Message: '{session.result_msg}'",
+                        end="\r",
+                    )
+                    sys.stdout.flush()
+                nl = False
             time.sleep(1)
     except KeyboardInterrupt:
         print()
