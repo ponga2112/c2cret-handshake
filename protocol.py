@@ -207,7 +207,7 @@ class API:
         # TODO: Need to extend this out to handle DATA INFILL (for delivering arbitrary payloads, like binary malware)
         result = self._run_command(request)
         if isinstance(result, str):
-            result.encode()
+            result = result.encode()
         return self._run_command(request)
 
     def server_handle(self, request: bytes) -> bytes:
