@@ -281,7 +281,7 @@ class Session:
             max_msg_len = int(self.mss / 2)
         chunks = [message[i : i + max_msg_len] for i in range(0, len(message), max_msg_len)]
         if VERBOSE:
-            print(f"[+] Attempting to send {len(message)} bytes in {len(chunks)} threads...")
+            print(f"[+] Attempting to send {len(message)} bytes in {len(chunks)} fragments using {THREADS} threads...")
         smuggle = Message()
         # First chunk our message up into fragments
         fragments = []
