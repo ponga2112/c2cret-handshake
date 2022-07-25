@@ -408,7 +408,7 @@ class Session:
         # TODO: MAKE THIS SEND WITH THREADS!!!
         # TODO: we'll want to blast chunks, then send a RESPONSE msg type when done
         # // threading this will... be interesting to say the least
-
+        start_time_ms = int(int(time.time_ns()) / NS_TO_MS)
         chunks_last_index = len(chunks) - 1
         smuggle = Message()
         for k, v in enumerate(chunks):
