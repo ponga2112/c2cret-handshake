@@ -230,7 +230,6 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
                 self.CLIENT_DICT[client_id].stats["total_rtt_ms"] = int(time.time_ns() / NS_TO_MS)
             else:
                 reply_msg_headers.header = client_id + ServerMessage.ACK
-            self._print_verbose_response(server_reply_payload)
         if client_msg_type == ClientMessage.FRAGMENT:
             mesg_decoded_bytes = b""
             # print(f"!! DEBUG: in fragment")
@@ -292,6 +291,7 @@ class TLSServer(socketserver.ThreadingMixIn, TLSSocketServerMixIn, http.server.H
         #         f"SEND > [[ {len(cmd_msg)} bytes; client_id: {client_id.hex()}; msg_type={reply_msg_type.hex()}; decoded_san= ` {cmd_msg.decode()[:50]} ` ]]"
         #     )
         server_reply_payload = reply_msg_headers.hex().encode() + server_reply_payload
+        self._print_verbose_response(server_reply_payload)
         self.set_cert(server_reply_payload)
 
         return (X509CertChain([self.KEYSTORE.public.tlslite]), self._get_random_seed())
