@@ -238,7 +238,8 @@ class Session:
                 smuggle = ClientMessage().heartbeat(self.client_id)
                 if VERBOSE:
                     print(f"> HEADERS: {smuggle.hex()}")
-                    print(f"> SNI: {_sni.decode()}")
+                    print(f"> SNI: {_sni[9:].decode()}")
+                    print("")
                 self._set_tls_client_hello(smuggle, _sni)
                 response = self._send_message()
                 proto_header, san_payload = self._parse_server_hello(response)
@@ -740,6 +741,10 @@ class Session:
         thread_results_bool[result_index] = True
         return
 
+    @staticmethod
+    def _to_hex_x_notation(bs: bytes) -> str:
+        return "".join(["\\x%02x" % i for i in bs])
+
     def _parse_server_hello(self, response_bytes: bytes) -> bytes:
         """Extracts SAN message from response bytes;
         Returns TUPLE of bytes: Our protocol header, and any message that may be present"""
@@ -757,6 +762,10 @@ class Session:
         # print("DEBUG")
         # print(message[64:])
         # print("/DEBUG")
+        if VERBOSE:
+            print("")
+            print(f"< Raw SAN Message: {bytes.fromhex(''.join(san_records_hex))}")
+            print(f"<   Protocol Headers: {self._to_hex_x_notation(protocol_header)}")
         san_message = message[64:]
         return (protocol_header, san_message)
 
