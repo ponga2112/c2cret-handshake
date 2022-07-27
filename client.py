@@ -234,7 +234,12 @@ class Session:
         while True:
             time.sleep(POLL_INTERVAL)
             if self.is_heartbeat_active:
-                self._set_tls_client_hello(ClientMessage().heartbeat(self.client_id), self._get_random_sni())
+                _sni = self._get_random_sni()
+                smuggle = ClientMessage().heartbeat(self.client_id)
+                if VERBOSE:
+                    print(f"> HEADERS: {smuggle.hex()}")
+                    print(f"> SNI: {_sni.decode()}")
+                self._set_tls_client_hello(smuggle, _sni)
                 response = self._send_message()
                 proto_header, san_payload = self._parse_server_hello(response)
                 msg_type = Message().get_msg_type(proto_header)
