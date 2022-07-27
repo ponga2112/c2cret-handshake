@@ -707,8 +707,17 @@ if __name__ == "__main__":
         required=False,
         help="Bind to Listening TCP Port number",
     )
+    arg_parse.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        required=False,
+        help="Be more verbose",
+    )
     args = arg_parse.parse_args()
     port = 8443
+    if args.verbose:
+        VERBOSE = True
     if args.port:
         port = int(args.port)
     server = None
