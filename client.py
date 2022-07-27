@@ -922,13 +922,6 @@ if __name__ == "__main__":
         help="Manually set the smuggling mode [ 'sni' || 'seed' ]",
     )
     arg_parse.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        required=False,
-        help="Print out all request and response sent/rcvd",
-    )
-    arg_parse.add_argument(
         "-c",
         "--connection",
         action="store_true",
